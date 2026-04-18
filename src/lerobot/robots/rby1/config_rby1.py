@@ -33,7 +33,12 @@ class RBY1Config(RobotConfig):
 
     # SDK parameters
     state_update_hz: int = 100
-    command_duration: float = 0.1  # seconds per joint position command
+    # minimum_time for each SDK joint-position command. 0.1 matches the known-working
+    # rby1_standalone replay.py, paired with a ~10 Hz command rate.
+    command_duration: float = 0.1
+    # Stream priority for the command stream (SDK commanding mode). Higher = preempts
+    # lower-priority streams. Matches rby1_standalone/replay.py's `create_command_stream(10)`.
+    command_stream_priority: int = 10
 
     # When True, send_action() will NOT send joint commands to the robot via the SDK.
     # Use this when an external controller (e.g. the Rainbow master arm teleop) is

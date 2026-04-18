@@ -210,6 +210,10 @@ class DatasetRecordConfig:
     encoder_threads: int | None = None
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # If True, block on stdin Enter before each episode starts (after init).
+    # Useful when you want to manually position the robot and start the teleop
+    # motion before any frames are recorded.
+    prompt_before_episode: bool = False
 
     def __post_init__(self):
         if self.single_task is None:
@@ -599,6 +603,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                if cfg.dataset.prompt_before_episode:
+                    input(f"Press Enter to START recording episode {dataset.num_episodes}...")
+                    # The Enter keypress that unblocked input() is also seen by the pynput
+                    # listener and would otherwise end the episode immediately. Consume it.
+                    events["exit_early"] = False
                 record_loop(
                     robot=robot,
                     events=events,

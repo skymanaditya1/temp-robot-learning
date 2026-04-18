@@ -90,6 +90,7 @@ class RBY1(Robot):
         self.config = config
 
         self._robot = None  # rby1_sdk robot handle
+        self._command_stream = None  # rby1_sdk command stream (SDK commanding mode only)
         self._is_connected = False
 
         # Thread-safe state from SDK callback
@@ -186,6 +187,23 @@ class RBY1(Robot):
 
         mode = "external (send_action is a no-op)" if self.config.use_external_commands else "SDK commanding"
         logger.info(f"Command mode: {mode}")
+
+        if not self.config.use_external_commands:
+            logger.info("Enabling servo + control manager for SDK commanding...")
+            if not self._robot.is_servo_on(".*"):
+                if not self._robot.servo_on(".*"):
+                    raise RuntimeError("Failed to servo on")
+            self._robot.reset_fault_control_manager()
+            if not self._robot.enable_control_manager():
+                raise RuntimeError("Failed to enable control manager")
+            # Open a priority command stream for high-rate joint position commanding
+            # (matches rby1_standalone/replay.py pattern).
+            self._command_stream = self._robot.create_command_stream(
+                self.config.command_stream_priority
+            )
+            logger.info(
+                f"Command stream opened (priority={self.config.command_stream_priority})"
+            )
 
         # Initialize gripper bus (read-only)
         if self.config.with_right_gripper or self.config.with_left_gripper:
@@ -291,100 +309,82 @@ class RBY1(Robot):
             self.logs["write_pos_dt_s"] = time.perf_counter() - before_write_t
             return action
 
+        if self._command_stream is None:
+            raise RuntimeError(
+                "Command stream not initialized; connect() must run with "
+                "use_external_commands=False"
+            )
+
         import rby1_sdk
 
         duration = self.config.command_duration
 
+        # Snapshot latest robot state so joints we aren't commanding can hold still
+        with self._state_lock:
+            state = self._latest_state
+
         # Apply safety limits if configured
-        if self.config.max_relative_target is not None and joint_goals:
-            with self._state_lock:
-                state = self._latest_state
-
-            if state is not None:
-                goal_present_pos = {}
-                for key, goal in joint_goals.items():
-                    idx = self._joints_dict[key]
-                    goal_present_pos[key] = (goal, float(state[idx]))
-                joint_goals = ensure_safe_goal_position(
-                    goal_present_pos, self.config.max_relative_target
-                )
-
-        # Build SDK command
-        comp_command = rby1_sdk.ComponentBasedCommandBuilder()
-        body_cmd = rby1_sdk.BodyComponentBasedCommandBuilder()
-        has_body_cmd = False
-
-        # Torso command
-        if self.config.with_torso:
-            torso_pos = [joint_goals.get(k, 0.0) for k in RBY1_TORSO_JOINTS]
-            torso_cmd = (
-                rby1_sdk.JointPositionCommandBuilder()
-                .set_minimum_time(duration)
-                .set_position(torso_pos)
-                .set_command_header(
-                    rby1_sdk.CommandHeaderBuilder().set_control_hold_time(2 * duration)
-                )
+        if self.config.max_relative_target is not None and joint_goals and state is not None:
+            goal_present_pos = {
+                key: (goal, float(state[self._joints_dict[key]]))
+                for key, goal in joint_goals.items()
+            }
+            joint_goals = ensure_safe_goal_position(
+                goal_present_pos, self.config.max_relative_target
             )
-            body_cmd.set_torso_command(torso_cmd)
-            has_body_cmd = True
 
-        # Right arm command
-        if self.config.with_right_arm:
-            right_pos = [joint_goals.get(k, 0.0) for k in RBY1_RIGHT_ARM_JOINTS]
-            right_cmd = (
-                rby1_sdk.JointPositionCommandBuilder()
-                .set_minimum_time(duration)
-                .set_position(right_pos)
-                .set_command_header(
-                    rby1_sdk.CommandHeaderBuilder().set_control_hold_time(2 * duration)
-                )
+        # Build the full 20-joint body vector: torso (6) + right_arm (7) + left_arm (7).
+        # For joints the action dict doesn't include (e.g. torso when with_torso=False),
+        # hold the current position so the robot doesn't move those joints.
+        def _joint_target(name_to_idx: dict[str, int]) -> list[float]:
+            out: list[float] = []
+            for name, idx in name_to_idx.items():
+                if name in joint_goals:
+                    out.append(joint_goals[name])
+                elif state is not None:
+                    out.append(float(state[idx]))
+                else:
+                    out.append(0.0)
+            return out
+
+        body_pos = (
+            _joint_target(RBY1_TORSO_JOINTS)
+            + _joint_target(RBY1_RIGHT_ARM_JOINTS)
+            + _joint_target(RBY1_LEFT_ARM_JOINTS)
+        )
+
+        # Single body JointPositionCommand — matches rby1_standalone/replay.py.
+        body_cmd = (
+            rby1_sdk.JointPositionCommandBuilder()
+            .set_command_header(
+                rby1_sdk.CommandHeaderBuilder().set_control_hold_time(1)
             )
-            body_cmd.set_right_arm_command(right_cmd)
-            has_body_cmd = True
+            .set_minimum_time(duration)
+            .set_position(body_pos)
+        )
+        comp_command = rby1_sdk.ComponentBasedCommandBuilder().set_body_command(body_cmd)
 
-        # Left arm command
-        if self.config.with_left_arm:
-            left_pos = [joint_goals.get(k, 0.0) for k in RBY1_LEFT_ARM_JOINTS]
-            left_cmd = (
-                rby1_sdk.JointPositionCommandBuilder()
-                .set_minimum_time(duration)
-                .set_position(left_pos)
-                .set_command_header(
-                    rby1_sdk.CommandHeaderBuilder().set_control_hold_time(2 * duration)
-                )
-            )
-            body_cmd.set_left_arm_command(left_cmd)
-            has_body_cmd = True
-
-        if has_body_cmd:
-            comp_command.set_body_command(body_cmd)
-
-        # Head command
+        # Head command (optional; kept separate from body).
         if self.config.with_head:
             head_pos = [joint_goals.get(k, 0.0) for k in RBY1_HEAD_JOINTS]
             head_cmd = (
                 rby1_sdk.JointPositionCommandBuilder()
+                .set_command_header(
+                    rby1_sdk.CommandHeaderBuilder().set_control_hold_time(1)
+                )
                 .set_minimum_time(duration)
                 .set_position(head_pos)
-                .set_command_header(
-                    rby1_sdk.CommandHeaderBuilder().set_control_hold_time(2 * duration)
-                )
             )
             head_builder = rby1_sdk.HeadCommandBuilder()
             head_builder.set_command(head_cmd)
             comp_command.set_head_command(head_builder)
 
-        # Send robot command
-        robot_command = rby1_sdk.RobotCommandBuilder()
-        robot_command.set_command(comp_command)
-        self._robot.send_command(robot_command)
+        robot_command = rby1_sdk.RobotCommandBuilder().set_command(comp_command)
+        self._command_stream.send_command(robot_command)
 
-        # Send gripper commands (via Dynamixel)
-        # Note: gripper control requires a separate RainbowGripperController
-        # For now we log gripper goals; full gripper commanding requires
-        # the controller to be initialized with torque enabled.
+        # Gripper commanding is not yet implemented; goals are logged for debugging.
         if gripper_goals:
-            logger.debug(f"Gripper goals: {gripper_goals}")
+            logger.debug(f"Gripper goals (not yet commanded): {gripper_goals}")
 
         self.logs["write_pos_dt_s"] = time.perf_counter() - before_write_t
         return action
@@ -396,6 +396,16 @@ class RBY1(Robot):
         # Disconnect cameras
         for cam in self.cameras.values():
             cam.disconnect()
+
+        # Close command stream (SDK commanding mode only)
+        if self._command_stream is not None:
+            try:
+                # Not all SDK versions expose a stream close; guard defensively.
+                if hasattr(self._command_stream, "close"):
+                    self._command_stream.close()
+            except Exception:
+                pass
+            self._command_stream = None
 
         # Close gripper bus
         if self._gripper_bus is not None:
