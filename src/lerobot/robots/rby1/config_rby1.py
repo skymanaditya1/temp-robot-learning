@@ -59,11 +59,22 @@ class RBY1Config(RobotConfig):
     gripper_device: str = "/dev/rby1_gripper"
     gripper_baudrate: int = 2_000_000
 
-    # Gripper encoder-to-meters calibration.
-    # Raw Dynamixel encoder values at fully open and fully closed positions.
-    # Used to convert raw encoder readings to gripper width in meters (0.0–0.1m).
-    gripper_enc_open: float = 1.3   # encoder radians when gripper is fully open
-    gripper_enc_closed: float = 5.9  # encoder radians when gripper is fully closed
+    # When True and use_external_commands=False, RBY1 will actively drive the
+    # Dynamixel grippers via a background thread so recorded gripper values are
+    # replayed on the real hardware. Automatically skipped in master-arm mode.
+    enable_gripper_commanding: bool = True
+    # Per-gripper current cap (amps) in CurrentBasedPositionControlMode. 5 A matches
+    # rby1_standalone/replay.py. Lower = softer grasp, higher = firmer but risks damage.
+    gripper_current_a: float = 5.0
+
+    # Per-gripper encoder-to-meters calibration. Raw Dynamixel encoder values at
+    # fully open and fully closed positions. Defaults measured empirically — the
+    # multi-turn encoders span ~9.5 rad of motion with different offsets per side.
+    # Recalibrate if dataset values drift outside [0.0, 0.1] m.
+    right_gripper_enc_open: float = 4.83
+    right_gripper_enc_closed: float = -4.74
+    left_gripper_enc_open: float = 1.26
+    left_gripper_enc_closed: float = -8.24
 
     # Cameras (typically ZMQ cameras for ZED)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)

@@ -143,25 +143,45 @@ class RBY1Leader(Teleoperator):
         with self._state_lock:
             self._latest_state = state.position.copy()
 
-    def _encoder_to_meters(self, raw_enc: float) -> float:
+    def _gripper_calibration(self, dxl_id: int) -> tuple[float, float]:
+        """Return (enc_open, enc_closed) for the given Dynamixel id (0=right, 1=left)."""
+        if dxl_id == 0:
+            return self.config.right_gripper_enc_open, self.config.right_gripper_enc_closed
+        elif dxl_id == 1:
+            return self.config.left_gripper_enc_open, self.config.left_gripper_enc_closed
+        raise ValueError(f"unknown gripper dxl_id: {dxl_id}")
+
+    def _encoder_to_meters(self, raw_enc: float, dxl_id: int) -> float:
         """Convert raw Dynamixel encoder value to gripper width in meters (0.0–0.1m)."""
-        enc_open = self.config.gripper_enc_open
-        enc_closed = self.config.gripper_enc_closed
-        # Linear interpolation: enc_open -> 0.1m (fully open), enc_closed -> 0.0m (fully closed)
+        enc_open, enc_closed = self._gripper_calibration(dxl_id)
         width_m = 0.1 * (raw_enc - enc_closed) / (enc_open - enc_closed)
         return float(np.clip(width_m, 0.0, 0.1))
 
     def _read_gripper_positions(self) -> None:
+        """With the master-arm process contending on the bus, id 1 often loses
+        its response in a combined `[0, 1]` sync read. Retry missing ids solo.
+        """
         if self._gripper_bus is None:
             return
         try:
             rv = self._gripper_bus.group_fast_sync_read_encoder([0, 1])
-            if rv is not None:
-                for dev_id, enc in rv:
-                    if dev_id < 2:
-                        self._gripper_positions[dev_id] = enc
         except Exception:
-            pass
+            rv = None
+        got: set[int] = set()
+        if rv is not None:
+            for dev_id, enc in rv:
+                if dev_id < 2:
+                    self._gripper_positions[dev_id] = enc
+                    got.add(int(dev_id))
+        for missing in {0, 1} - got:
+            try:
+                rv2 = self._gripper_bus.group_fast_sync_read_encoder([missing])
+                if rv2 is not None:
+                    for dev_id, enc in rv2:
+                        if dev_id < 2:
+                            self._gripper_positions[dev_id] = enc
+            except Exception:
+                pass
 
     def get_action(self) -> dict[str, float]:
         start = time.perf_counter()
@@ -183,7 +203,7 @@ class RBY1Leader(Teleoperator):
         self._read_gripper_positions()
         for key, dxl_id in self._gripper_keys.items():
             raw_enc = float(self._gripper_positions[dxl_id])
-            action[key] = self._encoder_to_meters(raw_enc)
+            action[key] = self._encoder_to_meters(raw_enc, dxl_id)
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"RBY1 leader read action: {dt_ms:.1f}ms")

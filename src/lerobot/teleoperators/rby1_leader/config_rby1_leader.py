@@ -30,12 +30,11 @@ class RBY1LeaderConfig(TeleoperatorConfig):
     gripper_device: str = "/dev/rby1_gripper"
     gripper_baudrate: int = 2_000_000
 
-    # Gripper encoder-to-meters calibration.
-    # Raw Dynamixel encoder values at fully open and fully closed positions.
-    # Used to convert raw encoder readings to gripper width in meters (0.0–0.1m).
-    # Measure these after each gripper homing if they shift between sessions.
-    gripper_enc_open: float = 1.3   # encoder radians when gripper is fully open
-    gripper_enc_closed: float = 5.9  # encoder radians when gripper is fully closed
+    # Per-gripper encoder-to-meters calibration. See RBY1Config docstring.
+    right_gripper_enc_open: float = 4.83
+    right_gripper_enc_closed: float = -4.74
+    left_gripper_enc_open: float = 1.26
+    left_gripper_enc_closed: float = -8.24
 
     def __post_init__(self):
         if not (

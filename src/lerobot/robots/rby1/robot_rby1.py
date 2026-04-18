@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any
 
 import numpy as np
@@ -99,7 +99,14 @@ class RBY1(Robot):
 
         # Gripper state (read via Dynamixel bus)
         self._gripper_bus = None
-        self._gripper_positions = [0.0, 0.0]  # [right, left]
+        self._gripper_positions = [0.0, 0.0]  # [right, left] — latest encoder reads
+
+        # Gripper command state (SDK commanding mode only)
+        self._gripper_write_enabled = False
+        self._gripper_target_enc: list[float] = [0.0, 0.0]  # [right, left] — write thread target
+        self._gripper_target_lock = Lock()
+        self._gripper_writer_running = False
+        self._gripper_writer_thread: Thread | None = None
 
         # Cameras
         self.cameras = make_cameras_from_configs(config.cameras)
@@ -205,7 +212,8 @@ class RBY1(Robot):
                 f"Command stream opened (priority={self.config.command_stream_priority})"
             )
 
-        # Initialize gripper bus (read-only)
+        # Initialize gripper bus (read-only by default; upgraded to read+write below
+        # when SDK commanding + gripper commanding are both enabled).
         if self.config.with_right_gripper or self.config.with_left_gripper:
             try:
                 self._gripper_bus = rby1_sdk.DynamixelBus(rby1_sdk.upc.GripperDeviceName)
@@ -215,6 +223,49 @@ class RBY1(Robot):
             except Exception as e:
                 logger.warning(f"Failed to open gripper bus: {e}. Gripper readings will be zero.")
                 self._gripper_bus = None
+
+        # Gripper write setup (only when SDK commanding + gripper commanding enabled).
+        if (
+            not self.config.use_external_commands
+            and self.config.enable_gripper_commanding
+            and self._gripper_bus is not None
+        ):
+            try:
+                logger.info("Configuring gripper bus for writing...")
+                for arm in ("right", "left"):
+                    self._robot.set_tool_flange_output_voltage(arm, 12)
+                self._gripper_bus.set_torque_constant([1, 1])
+                self._gripper_bus.group_sync_write_torque_enable([(0, 1), (1, 1)])
+                self._gripper_bus.group_sync_write_operating_mode(
+                    [
+                        (0, rby1_sdk.DynamixelBus.CurrentBasedPositionControlMode),
+                        (1, rby1_sdk.DynamixelBus.CurrentBasedPositionControlMode),
+                    ]
+                )
+                self._gripper_bus.group_sync_write_torque_enable([(0, 1), (1, 1)])
+                cur = int(self.config.gripper_current_a)
+                self._gripper_bus.group_sync_write_send_torque([(0, cur), (1, cur)])
+
+                # Seed the write target with the current reading so grippers hold still
+                # until send_action() supplies a real target.
+                self._read_gripper_positions()
+                with self._gripper_target_lock:
+                    self._gripper_target_enc = list(self._gripper_positions)
+
+                self._gripper_writer_running = True
+                self._gripper_writer_thread = Thread(
+                    target=self._gripper_writer_loop, daemon=True
+                )
+                self._gripper_writer_thread.start()
+                self._gripper_write_enabled = True
+                logger.info(
+                    f"Gripper writer started (current cap {cur} A, 20 Hz)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to enable gripper commanding: {e}. Grippers will be read-only."
+                )
+                self._gripper_write_enabled = False
 
         # Connect cameras
         for cam in self.cameras.values():
@@ -236,25 +287,70 @@ class RBY1(Robot):
         with self._state_lock:
             self._latest_state = state.position.copy()
 
-    def _encoder_to_meters(self, raw_enc: float) -> float:
+    def _gripper_calibration(self, dxl_id: int) -> tuple[float, float]:
+        """Return (enc_open, enc_closed) for the given Dynamixel id (0=right, 1=left)."""
+        if dxl_id == 0:
+            return self.config.right_gripper_enc_open, self.config.right_gripper_enc_closed
+        elif dxl_id == 1:
+            return self.config.left_gripper_enc_open, self.config.left_gripper_enc_closed
+        raise ValueError(f"unknown gripper dxl_id: {dxl_id}")
+
+    def _encoder_to_meters(self, raw_enc: float, dxl_id: int) -> float:
         """Convert raw Dynamixel encoder value to gripper width in meters (0.0–0.1m)."""
-        enc_open = self.config.gripper_enc_open
-        enc_closed = self.config.gripper_enc_closed
+        enc_open, enc_closed = self._gripper_calibration(dxl_id)
         width_m = 0.1 * (raw_enc - enc_closed) / (enc_open - enc_closed)
         return float(np.clip(width_m, 0.0, 0.1))
 
+    def _meters_to_encoder(self, width_m: float, dxl_id: int) -> float:
+        """Inverse of _encoder_to_meters. Clamps input to the 0.0-0.1m range first."""
+        width_m = float(np.clip(width_m, 0.0, 0.1))
+        enc_open, enc_closed = self._gripper_calibration(dxl_id)
+        return enc_closed + (width_m / 0.1) * (enc_open - enc_closed)
+
+    def _gripper_writer_loop(self) -> None:
+        """Background thread: at 20 Hz, write the latest gripper target positions."""
+        period = 0.05  # 20 Hz
+        while self._gripper_writer_running:
+            try:
+                with self._gripper_target_lock:
+                    targets = list(self._gripper_target_enc)
+                if self._gripper_bus is not None:
+                    self._gripper_bus.group_sync_write_send_position(
+                        [(dev_id, q) for dev_id, q in enumerate(targets)]
+                    )
+            except Exception as e:
+                # Don't kill the thread on transient bus errors.
+                logger.debug(f"gripper writer tick error: {e}")
+            time.sleep(period)
+
     def _read_gripper_positions(self) -> None:
-        """Read gripper encoder positions from Dynamixel bus."""
+        """Read gripper encoder positions from Dynamixel bus.
+
+        With the master-arm teleop process contending on the same RS-485 bus,
+        the second id in a `group_fast_sync_read_encoder([0, 1])` request often
+        gets its response packet stomped. We retry any missing id individually.
+        """
         if self._gripper_bus is None:
             return
         try:
             rv = self._gripper_bus.group_fast_sync_read_encoder([0, 1])
-            if rv is not None:
-                for dev_id, enc in rv:
-                    if dev_id < 2:
-                        self._gripper_positions[dev_id] = enc
         except Exception:
-            pass  # Gripper read failures are non-critical
+            rv = None
+        got: set[int] = set()
+        if rv is not None:
+            for dev_id, enc in rv:
+                if dev_id < 2:
+                    self._gripper_positions[dev_id] = enc
+                    got.add(int(dev_id))
+        for missing in {0, 1} - got:
+            try:
+                rv2 = self._gripper_bus.group_fast_sync_read_encoder([missing])
+                if rv2 is not None:
+                    for dev_id, enc in rv2:
+                        if dev_id < 2:
+                            self._gripper_positions[dev_id] = enc
+            except Exception:
+                pass  # Gripper read failures are non-critical
 
     def get_observation(self) -> RobotObservation:
         obs_dict: RobotObservation = {}
@@ -276,7 +372,7 @@ class RBY1(Robot):
         self._read_gripper_positions()
         for key, dxl_id in self._gripper_keys.items():
             raw_enc = float(self._gripper_positions[dxl_id])
-            obs_dict[key] = self._encoder_to_meters(raw_enc)
+            obs_dict[key] = self._encoder_to_meters(raw_enc, dxl_id)
 
         self.logs["read_pos_dt_s"] = time.perf_counter() - before_read_t
 
@@ -382,9 +478,14 @@ class RBY1(Robot):
         robot_command = rby1_sdk.RobotCommandBuilder().set_command(comp_command)
         self._command_stream.send_command(robot_command)
 
-        # Gripper commanding is not yet implemented; goals are logged for debugging.
-        if gripper_goals:
-            logger.debug(f"Gripper goals (not yet commanded): {gripper_goals}")
+        # Gripper commanding: push the latest target encoder values to the writer thread.
+        if gripper_goals and self._gripper_write_enabled:
+            with self._gripper_target_lock:
+                new_target = list(self._gripper_target_enc)
+                for key, dxl_id in self._gripper_keys.items():
+                    if key in gripper_goals:
+                        new_target[dxl_id] = self._meters_to_encoder(gripper_goals[key], dxl_id)
+                self._gripper_target_enc = new_target
 
         self.logs["write_pos_dt_s"] = time.perf_counter() - before_write_t
         return action
@@ -396,6 +497,20 @@ class RBY1(Robot):
         # Disconnect cameras
         for cam in self.cameras.values():
             cam.disconnect()
+
+        # Stop gripper writer thread (SDK commanding mode) and disable torque so the
+        # grippers don't continue holding force after we disconnect.
+        if self._gripper_writer_running:
+            self._gripper_writer_running = False
+            if self._gripper_writer_thread is not None:
+                self._gripper_writer_thread.join(timeout=1.0)
+                self._gripper_writer_thread = None
+        if self._gripper_write_enabled and self._gripper_bus is not None:
+            try:
+                self._gripper_bus.group_sync_write_torque_enable([(0, 0), (1, 0)])
+            except Exception:
+                pass
+            self._gripper_write_enabled = False
 
         # Close command stream (SDK commanding mode only)
         if self._command_stream is not None:
