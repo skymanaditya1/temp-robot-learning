@@ -181,8 +181,19 @@ def run_camera_publisher(
             # Convert BGRA to BGR for JPEG encoding
             frame_bgr = frame[:, :, :3]
 
-            # Optionally resize before encoding
+            # Center-crop to match the output aspect ratio, then resize. This avoids
+            # the horizontal squash you'd get from forcing 16:9 source into a 4:3 target.
             if resize_wh is not None:
+                h, w = frame_bgr.shape[:2]
+                target_w = int(round(h * resize_wh[0] / resize_wh[1]))
+                if target_w < w:
+                    x_start = (w - target_w) // 2
+                    frame_bgr = frame_bgr[:, x_start:x_start + target_w]
+                elif target_w > w:
+                    # Source narrower than target -> crop top/bottom instead.
+                    target_h = int(round(w * resize_wh[1] / resize_wh[0]))
+                    y_start = (h - target_h) // 2
+                    frame_bgr = frame_bgr[y_start:y_start + target_h, :]
                 frame_bgr = cv2.resize(frame_bgr, resize_wh, interpolation=cv2.INTER_AREA)
 
             # Encode as JPEG
