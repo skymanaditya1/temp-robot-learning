@@ -101,9 +101,14 @@ class RBY1(Robot):
         self._gripper_bus = None
         self._gripper_positions = [0.0, 0.0]  # [right, left] — latest encoder reads
 
-        # Gripper command state (SDK commanding mode only)
+        # Gripper command state (SDK commanding mode only). After homing, we switch
+        # to CurrentBasedPositionControlMode and command raw encoder positions within
+        # the homed [min_q, max_q] range per gripper. The current cap is the grasp
+        # force when the block stops the gripper before it reaches target.
         self._gripper_write_enabled = False
-        self._gripper_target_enc: list[float] = [0.0, 0.0]  # [right, left] — write thread target
+        self._gripper_target_position: list[float] = [0.0, 0.0]  # [right, left] raw enc
+        self._gripper_homed_min: list[float] = [0.0, 0.0]  # [right, left] raw enc (closed)
+        self._gripper_homed_max: list[float] = [0.0, 0.0]  # [right, left] raw enc (open)
         self._gripper_target_lock = Lock()
         self._gripper_writer_running = False
         self._gripper_writer_thread: Thread | None = None
@@ -231,11 +236,27 @@ class RBY1(Robot):
             and self._gripper_bus is not None
         ):
             try:
-                logger.info("Configuring gripper bus for writing...")
+                logger.info("Configuring gripper bus for writing (CurrentControlMode)...")
                 for arm in ("right", "left"):
                     self._robot.set_tool_flange_output_voltage(arm, 12)
                 self._gripper_bus.set_torque_constant([1, 1])
+                # Torque must be disabled before operating-mode change.
+                self._gripper_bus.group_sync_write_torque_enable([(0, 0), (1, 0)])
+                self._gripper_bus.group_sync_write_operating_mode(
+                    [
+                        (0, rby1_sdk.DynamixelBus.CurrentControlMode),
+                        (1, rby1_sdk.DynamixelBus.CurrentControlMode),
+                    ]
+                )
                 self._gripper_bus.group_sync_write_torque_enable([(0, 1), (1, 1)])
+
+                # Home the grippers in CurrentControlMode so we can cross the default
+                # position limits, then switch to CurrentBasedPositionControlMode with
+                # a current cap for ordinary operation (mirrors arms_teleop.Gripper.loop).
+                self._home_grippers()
+
+                # Switch to position control for ordinary operation.
+                self._gripper_bus.group_sync_write_torque_enable([(0, 0), (1, 0)])
                 self._gripper_bus.group_sync_write_operating_mode(
                     [
                         (0, rby1_sdk.DynamixelBus.CurrentBasedPositionControlMode),
@@ -243,14 +264,14 @@ class RBY1(Robot):
                     ]
                 )
                 self._gripper_bus.group_sync_write_torque_enable([(0, 1), (1, 1)])
-                cur = int(self.config.gripper_current_a)
-                self._gripper_bus.group_sync_write_send_torque([(0, cur), (1, cur)])
+                cap = int(self.config.gripper_current_cap)
+                self._gripper_bus.group_sync_write_send_torque([(0, cap), (1, cap)])
 
-                # Seed the write target with the current reading so grippers hold still
-                # until send_action() supplies a real target.
+                # Seed target to the current position so the gripper doesn't jerk
+                # when the writer thread starts.
                 self._read_gripper_positions()
                 with self._gripper_target_lock:
-                    self._gripper_target_enc = list(self._gripper_positions)
+                    self._gripper_target_position = list(self._gripper_positions)
 
                 self._gripper_writer_running = True
                 self._gripper_writer_thread = Thread(
@@ -259,7 +280,10 @@ class RBY1(Robot):
                 self._gripper_writer_thread.start()
                 self._gripper_write_enabled = True
                 logger.info(
-                    f"Gripper writer started (current cap {cur} A, 20 Hz)"
+                    f"Gripper writer started in CurrentBasedPositionControlMode "
+                    f"(current cap {cap}, 20 Hz). Homed ranges: "
+                    f"right=[{self._gripper_homed_min[0]:.2f}, {self._gripper_homed_max[0]:.2f}], "
+                    f"left=[{self._gripper_homed_min[1]:.2f}, {self._gripper_homed_max[1]:.2f}]"
                 )
             except Exception as e:
                 logger.warning(
@@ -307,20 +331,105 @@ class RBY1(Robot):
         enc_open, enc_closed = self._gripper_calibration(dxl_id)
         return enc_closed + (width_m / 0.1) * (enc_open - enc_closed)
 
+    def _home_grippers(self) -> None:
+        """Drive each gripper to both mechanical extremes under low current so
+        the motor's multi-turn state is initialized for the session. Mirrors
+        arms_teleop.py's Gripper.homing(). Without this, CurrentControlMode
+        commands get stuck at whatever partial-closure clamp the firmware
+        happens to have from power-on.
+
+        Assumes the bus is already in CurrentControlMode with torque enabled.
+        """
+        tick_s = 0.1
+        stability_ticks = 20
+        stability_tol = 0.02
+        homing_current = 0.5
+
+        logger.info("Homing grippers (~5-10 s)...")
+        q = np.array([0.0, 0.0])
+        prev_q = q.copy()
+        direction = 0
+        counter = 0
+        start_t = time.time()
+        min_q = np.array([np.inf, np.inf])
+        max_q = np.array([-np.inf, -np.inf])
+
+        while direction < 2:
+            sign = 1 if direction == 0 else -1
+            try:
+                self._gripper_bus.group_sync_write_send_torque(
+                    [(0, sign * homing_current), (1, sign * homing_current)]
+                )
+            except Exception as e:
+                logger.warning(f"Homing send_torque failed: {e}")
+            rv = None
+            try:
+                rv = self._gripper_bus.group_fast_sync_read_encoder([0, 1])
+            except Exception:
+                pass
+            if rv is not None:
+                for dev_id, enc in rv:
+                    if 0 <= int(dev_id) < 2:
+                        q[int(dev_id)] = float(enc)
+                min_q = np.minimum(min_q, q)
+                max_q = np.maximum(max_q, q)
+            if np.allclose(prev_q, q, atol=stability_tol):
+                counter += 1
+            else:
+                counter = 0
+            prev_q = q.copy()
+            if counter >= stability_ticks:
+                logger.info(
+                    f"  homing direction {direction} settled at q={q.tolist()}"
+                )
+                direction += 1
+                counter = 0
+            time.sleep(tick_s)
+            # Safety timeout so we never loop forever.
+            if time.time() - start_t > 20.0:
+                logger.warning("Homing timed out after 20 s; proceeding anyway.")
+                break
+
+        # Park at zero current so the gripper doesn't fight anything post-homing.
+        try:
+            self._gripper_bus.group_sync_write_send_torque([(0, 0.0), (1, 0.0)])
+        except Exception:
+            pass
+        logger.info(
+            f"Homing complete. "
+            f"right: min={min_q[0]:.3f} max={max_q[0]:.3f} span={max_q[0]-min_q[0]:.3f} | "
+            f"left: min={min_q[1]:.3f} max={max_q[1]:.3f} span={max_q[1]-min_q[1]:.3f}"
+        )
+        # Stash for position-command clamping.
+        self._gripper_homed_min = [float(min_q[0]), float(min_q[1])]
+        self._gripper_homed_max = [float(max_q[0]), float(max_q[1])]
+
     def _gripper_writer_loop(self) -> None:
         """Background thread: at 20 Hz, write the latest gripper target positions."""
         period = 0.05  # 20 Hz
+        tick = 0
         while self._gripper_writer_running:
             try:
                 with self._gripper_target_lock:
-                    targets = list(self._gripper_target_enc)
+                    targets = list(self._gripper_target_position)
                 if self._gripper_bus is not None:
                     self._gripper_bus.group_sync_write_send_position(
                         [(dev_id, q) for dev_id, q in enumerate(targets)]
                     )
+                # Periodic visibility: what are we commanding vs. actual position.
+                if tick % 40 == 0:
+                    try:
+                        rv = self._gripper_bus.group_fast_sync_read_encoder([0, 1])
+                        enc = {int(d): float(e) for d, e in (rv or [])}
+                        logger.info(
+                            f"gripper writer tick {tick}: target={targets} "
+                            f"enc_right={enc.get(0, 'n/a')} enc_left={enc.get(1, 'n/a')}"
+                        )
+                    except Exception:
+                        pass
+                tick += 1
             except Exception as e:
-                # Don't kill the thread on transient bus errors.
-                logger.debug(f"gripper writer tick error: {e}")
+                logger.warning(f"gripper writer tick error: {e}")
             time.sleep(period)
 
     def _read_gripper_positions(self) -> None:
@@ -476,16 +585,41 @@ class RBY1(Robot):
             comp_command.set_head_command(head_builder)
 
         robot_command = rby1_sdk.RobotCommandBuilder().set_command(comp_command)
-        self._command_stream.send_command(robot_command)
+        try:
+            self._command_stream.send_command(robot_command, timeout_ms=10000)
+        except Exception as e:
+            if "expired" in str(e).lower():
+                logger.warning("Command stream expired; recreating and retrying once.")
+                self._command_stream = self._robot.create_command_stream(
+                    self.config.command_stream_priority
+                )
+                self._command_stream.send_command(robot_command, timeout_ms=10000)
+            else:
+                raise
 
-        # Gripper commanding: push the latest target encoder values to the writer thread.
+        # Gripper commanding via CurrentControlMode: binary intent -> signed current.
+        # The gripper's internal position limits prevent position-control modes from
+        # reaching the fully-closed raw encoder range; pure current control is what
+        # the master-arm teleop uses during recording, and it bypasses those limits.
+        # Higher raw encoder value = more open, so +current opens, -current closes.
         if gripper_goals and self._gripper_write_enabled:
             with self._gripper_target_lock:
-                new_target = list(self._gripper_target_enc)
+                new_target = list(self._gripper_target_position)
                 for key, dxl_id in self._gripper_keys.items():
                     if key in gripper_goals:
-                        new_target[dxl_id] = self._meters_to_encoder(gripper_goals[key], dxl_id)
-                self._gripper_target_enc = new_target
+                        closed = gripper_goals[key] < self.config.gripper_close_threshold_m
+                        if closed:
+                            new_target[dxl_id] = self._gripper_homed_min[dxl_id]
+                        else:
+                            new_target[dxl_id] = self._gripper_homed_max[dxl_id]
+                if new_target != self._gripper_target_position:
+                    logger.info(
+                        f"gripper target changed: {self._gripper_target_position} -> {new_target} "
+                        f"(intents: "
+                        f"right={gripper_goals.get('right_gripper.pos', '-'):.3f}m, "
+                        f"left={gripper_goals.get('left_gripper.pos', '-'):.3f}m)"
+                    )
+                self._gripper_target_position = new_target
 
         self.logs["write_pos_dt_s"] = time.perf_counter() - before_write_t
         return action

@@ -63,9 +63,17 @@ class RBY1Config(RobotConfig):
     # Dynamixel grippers via a background thread so recorded gripper values are
     # replayed on the real hardware. Automatically skipped in master-arm mode.
     enable_gripper_commanding: bool = True
-    # Per-gripper current cap (amps) in CurrentBasedPositionControlMode. 5 A matches
-    # rby1_standalone/replay.py. Lower = softer grasp, higher = firmer but risks damage.
-    gripper_current_a: float = 5.0
+    # Gripper flow (matches arms_teleop.py): homing in CurrentControlMode first,
+    # then operate in CurrentBasedPositionControlMode with a fixed current cap and
+    # position commands bounded to the per-session homed [min_q, max_q] range.
+    # Current cap becomes the effective grasp force when the block stops the gripper
+    # before it reaches its target position.
+    gripper_current_cap: float = 5.0
+
+    # Recorded gripper width (m) below this -> command fully closed (min_q).
+    # At or above -> command fully open (max_q). 0.09 is above a typical grasp
+    # endpoint (~0.066 m), so grasps register as "closing intent".
+    gripper_close_threshold_m: float = 0.09
 
     # Per-gripper encoder-to-meters calibration. Raw Dynamixel encoder values at
     # fully open and fully closed positions. Defaults measured empirically — the
