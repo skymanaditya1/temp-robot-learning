@@ -592,6 +592,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if teleop is not None:
             teleop.connect()
 
+        if cfg.dataset.prompt_before_episode:
+            # Prompt before the keyboard listener starts, so Enter can't leak into
+            # exit_early. The listener starts right after and handles in-episode keys.
+            print("\n" + "=" * 60)
+            print(f"Ready to record {cfg.dataset.num_episodes} episode(s) @ {cfg.dataset.fps} fps.")
+            print(f"Dataset: {dataset.root}")
+            print("=" * 60)
+            input("Press Enter when you are ready to start recording...")
+
         listener, events = init_keyboard_listener()
 
         if not cfg.dataset.streaming_encoding:
@@ -603,11 +612,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                if cfg.dataset.prompt_before_episode:
-                    input(f"Press Enter to START recording episode {dataset.num_episodes}...")
-                    # The Enter keypress that unblocked input() is also seen by the pynput
-                    # listener and would otherwise end the episode immediately. Consume it.
-                    events["exit_early"] = False
                 record_loop(
                     robot=robot,
                     events=events,
@@ -627,35 +631,78 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                 )
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
+                if cfg.dataset.prompt_before_episode:
+                    # Interactive flow: stop the listener so stdin prompts aren't consumed.
+                    if not events["stop_recording"]:
+                        if listener is not None:
+                            listener.stop()
 
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
-                    )
+                        if events["rerecord_episode"]:
+                            log_say("Re-record episode", cfg.play_sounds)
+                            events["rerecord_episode"] = False
+                            events["exit_early"] = False
+                            dataset.clear_episode_buffer()
+                        else:
+                            buf = getattr(dataset.writer, "episode_buffer", None)
+                            num_frames_in_buffer = buf["size"] if buf is not None else 0
+                            if num_frames_in_buffer == 0:
+                                print("\nEpisode is empty (no frames captured). Discarding.")
+                                dataset.clear_episode_buffer()
+                            else:
+                                while True:
+                                    choice = input(
+                                        f"\nSave this episode? ({num_frames_in_buffer} frames) (y/n): "
+                                    ).strip().lower()
+                                    if choice in ("y", "n"):
+                                        break
+                                    print("Please enter 'y' or 'n'.")
+                                if choice == "n":
+                                    log_say("Discarding episode", cfg.play_sounds)
+                                    dataset.clear_episode_buffer()
+                                else:
+                                    dataset.save_episode()
+                                    recorded_episodes += 1
+                                    log_say(
+                                        f"Episode saved ({recorded_episodes}/{cfg.dataset.num_episodes})",
+                                        cfg.play_sounds,
+                                    )
 
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
+                        if (
+                            recorded_episodes < cfg.dataset.num_episodes
+                            and not events["stop_recording"]
+                        ):
+                            input("\nPress Enter to start next episode...")
 
-                dataset.save_episode()
-                recorded_episodes += 1
+                        listener, events = init_keyboard_listener()
+                else:
+                    # Default flow: reset window + auto-save (unchanged behavior).
+                    if not events["stop_recording"] and (
+                        (recorded_episodes < cfg.dataset.num_episodes - 1)
+                        or events["rerecord_episode"]
+                    ):
+                        log_say("Reset the environment", cfg.play_sounds)
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                        )
+
+                    if events["rerecord_episode"]:
+                        log_say("Re-record episode", cfg.play_sounds)
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        dataset.clear_episode_buffer()
+                        continue
+
+                    dataset.save_episode()
+                    recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
