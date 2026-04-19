@@ -57,4 +57,13 @@ export STAMP=$(date +%Y%m%d_%H%M%S) && export CAMS='{"head_cam":{"type":"zmq","s
 # running the record step with the video encoding and saving enabled 
 
 export STAMP=$(date +%Y%m%d_%H%M%S) && export CAMS='{"head_cam":{"type":"zmq","server_address":"127.0.0.1","port":5555,"camera_name":"head_cam","width":640,"height":480,"fps":10},"right_wrist_cam":{"type":"zmq","server_address":"127.0.0.1","port":5556,"camera_name":"right_wrist_cam","width":640,"height":480,"fps":10},"left_wrist_cam":{"type":"zmq","server_address":"127.0.0.1","port":5557,"camera_name":"left_wrist_cam","width":640,"height":480,"fps":10}}' && conda run -n policy_new --no-capture-output lerobot-record --robot.type=rby1 --robot.robot_address=192.168.30.1:50051 --robot.with_torso=false --robot.with_head=false --robot.cameras="$CAMS" --teleop.type=rby1_leader --teleop.robot_address=192.168.30.1:50051 --teleop.with_torso=false --teleop.with_head=false --dataset.repo_id=local/rby1_cam_${STAMP} --dataset.root=/data/objsearch/rby1_policy_learning/datasets/local/rby1_cam_${STAMP} --dataset.single_task="cameras test" --dataset.num_episodes=1 --dataset.episode_time_s=10 --dataset.fps=10 --dataset.push_to_hub=false --dataset.prompt_before_episode=true
+
+# Do a trajectory replay of the latest dataset that we recorded 
+
+conda run -n policy_new --no-capture-output lerobot-replay --robot.type=rby1 --robot.robot_address=192.168.30.1:50051 --robot.with_torso=false --robot.with_head=false --robot.use_external_commands=false --dataset.repo_id=local/rby1_cam_20260418_204936 --dataset.root=/data/objsearch/rby1_policy_learning/datasets/local/rby1_cam_20260418_204936 --dataset.episode=0 --dataset.fps=10
+```
+
+### Saving data for training ACT policies 
+```
+
 ```
