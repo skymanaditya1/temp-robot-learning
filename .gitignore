@@ -6,6 +6,8 @@ __pycache__/
 .claude/
 outputs/
 tests/outputs/
+tests/artifacts/
+tests/datasets/
 /datasets/
 wandb/
 *.log
