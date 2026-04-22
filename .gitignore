@@ -9,3 +9,4 @@ tests/outputs/
 /datasets/
 wandb/
 *.log
+temp_images/
