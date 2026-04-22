@@ -18,7 +18,12 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, TypedDict
+
+try:
+    from typing import Unpack  # Python 3.11+
+except ImportError:
+    from typing_extensions import Unpack  # Python 3.10 fallback
 
 import torch
 

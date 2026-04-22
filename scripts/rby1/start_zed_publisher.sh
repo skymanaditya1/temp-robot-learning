@@ -8,7 +8,13 @@
 #
 # Note: ZED XOne UHD cameras (the wrist cams) only support hd1080 and hd1200.
 # hd720 and lower resolutions are NOT supported on those cameras, so the
-# default here is hd1080 which works for all three.
+# global default here is hd1080 (works for both wrist cams).
+#
+# Per-camera resolution override: append ':<resolution>' as an optional 5th
+# field in each CameraSpec below (e.g. 'head_cam:stereo:32938613:5555:hd720').
+# Cameras without a 5th field fall back to the global --resolution value.
+# The head cam (ZED 2i) captures at hd720 here to reduce ZED compute while
+# the wrist cams stay at hd1080 (their only supported resolution).
 #
 # Usage:
 #   ./start_zed_publisher.sh                    # defaults: hd1080 @ 10 fps, resize to 640x480
@@ -26,7 +32,7 @@ RESIZE_W=${3:-640}
 RESIZE_H=${4:-480}
 
 CAMERAS=(
-    "head_cam:stereo:32938613:5555"
+    "head_cam:stereo:32938613:5555:hd720"
     "right_wrist_cam:mono:314996496:5556"
     "left_wrist_cam:mono:311689153:5557"
 )

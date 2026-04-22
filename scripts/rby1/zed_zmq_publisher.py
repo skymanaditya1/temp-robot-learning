@@ -68,20 +68,34 @@ class CameraSpec:
     cam_type: str  # "stereo" or "mono"
     serial: int
     port: int
+    resolution: str | None = None  # optional per-camera override (e.g. "hd720"); None => use global --resolution
 
 
 def parse_camera_spec(spec: str) -> CameraSpec:
-    """Parse 'name:type:serial:port' string into CameraSpec."""
+    """Parse 'name:type:serial:port[:resolution]' string into CameraSpec.
+
+    The optional 5th field lets a single camera override the global
+    --resolution (e.g. the head cam capturing hd720 while ZED One wrist cams
+    stay at hd1080, which is the only resolution they support).
+    """
     parts = spec.split(":")
-    if len(parts) != 4:
+    if len(parts) not in (4, 5):
         raise ValueError(
-            f"Camera spec must be 'name:type:serial:port' "
-            f"(e.g., 'chest_cam:stereo:36747794:5555'), got '{spec}'"
+            f"Camera spec must be 'name:type:serial:port[:resolution]' "
+            f"(e.g., 'chest_cam:stereo:36747794:5555' or "
+            f"'head_cam:stereo:32938613:5555:hd720'), got '{spec}'"
         )
     cam_type = parts[1].lower()
     if cam_type not in ("stereo", "mono"):
         raise ValueError(f"Camera type must be 'stereo' or 'mono', got '{cam_type}'")
-    return CameraSpec(name=parts[0], cam_type=cam_type, serial=int(parts[2]), port=int(parts[3]))
+    resolution = parts[4] if len(parts) == 5 else None
+    return CameraSpec(
+        name=parts[0],
+        cam_type=cam_type,
+        serial=int(parts[2]),
+        port=int(parts[3]),
+        resolution=resolution,
+    )
 
 
 def run_camera_publisher(
@@ -301,9 +315,12 @@ def main():
 
     threads: list[Thread] = []
     for spec in camera_specs:
+        cam_resolution = spec.resolution or args.resolution
+        if spec.resolution is not None:
+            logger.info(f"[{spec.name}] per-camera resolution override: {cam_resolution}")
         t = Thread(
             target=run_camera_publisher,
-            args=(spec, args.resolution, args.fps, args.jpeg_quality, args.depth_mode, resize_wh),
+            args=(spec, cam_resolution, args.fps, args.jpeg_quality, args.depth_mode, resize_wh),
             daemon=True,
             name=f"zed_pub_{spec.name}",
         )

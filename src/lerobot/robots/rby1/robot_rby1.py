@@ -267,8 +267,23 @@ class RBY1(Robot):
                 cap = int(self.config.gripper_current_cap)
                 self._gripper_bus.group_sync_write_send_torque([(0, cap), (1, cap)])
 
-                # Seed target to the current position so the gripper doesn't jerk
-                # when the writer thread starts.
+                # Park grippers OPEN so the initial rollout observation matches
+                # the training demos (which all started with grippers fully open).
+                # Without this, the policy sees an OOD "already closed" initial
+                # state and often fails to command the open-approach phase.
+                logger.info("Parking grippers OPEN...")
+                open_right, open_left = self._gripper_homed_max[0], self._gripper_homed_max[1]
+                for _ in range(40):  # ~2 s at 20 Hz
+                    try:
+                        self._gripper_bus.group_sync_write_send_position(
+                            [(0, open_right), (1, open_left)]
+                        )
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
+
+                # Seed writer target with the actual (now open) position so the
+                # gripper doesn't jerk when the writer thread starts.
                 self._read_gripper_positions()
                 with self._gripper_target_lock:
                     self._gripper_target_position = list(self._gripper_positions)
@@ -597,27 +612,29 @@ class RBY1(Robot):
             else:
                 raise
 
-        # Gripper commanding via CurrentControlMode: binary intent -> signed current.
-        # The gripper's internal position limits prevent position-control modes from
-        # reaching the fully-closed raw encoder range; pure current control is what
-        # the master-arm teleop uses during recording, and it bypasses those limits.
-        # Higher raw encoder value = more open, so +current opens, -current closes.
+        # Gripper commanding: continuous position control. The commanded width in
+        # meters is mapped to a raw Dynamixel encoder target via _meters_to_encoder
+        # and clamped to the per-session homed [min_q, max_q] range, so the writer
+        # thread drives the gripper to intermediate positions instead of snapping
+        # to fully-open / fully-closed endpoints. Current cap (gripper_current_cap)
+        # still bounds the grasp force.
         if gripper_goals and self._gripper_write_enabled:
             with self._gripper_target_lock:
                 new_target = list(self._gripper_target_position)
                 for key, dxl_id in self._gripper_keys.items():
                     if key in gripper_goals:
-                        closed = gripper_goals[key] < self.config.gripper_close_threshold_m
-                        if closed:
-                            new_target[dxl_id] = self._gripper_homed_min[dxl_id]
-                        else:
-                            new_target[dxl_id] = self._gripper_homed_max[dxl_id]
+                        enc = self._meters_to_encoder(gripper_goals[key], dxl_id)
+                        enc = float(np.clip(
+                            enc,
+                            self._gripper_homed_min[dxl_id],
+                            self._gripper_homed_max[dxl_id],
+                        ))
+                        new_target[dxl_id] = enc
                 if new_target != self._gripper_target_position:
                     logger.info(
-                        f"gripper target changed: {self._gripper_target_position} -> {new_target} "
-                        f"(intents: "
-                        f"right={gripper_goals.get('right_gripper.pos', '-'):.3f}m, "
-                        f"left={gripper_goals.get('left_gripper.pos', '-'):.3f}m)"
+                        f"gripper target: {self._gripper_target_position} -> {new_target} "
+                        f"(right={gripper_goals.get('right_gripper.pos', '-'):.4f}m, "
+                        f"left={gripper_goals.get('left_gripper.pos', '-'):.4f}m)"
                     )
                 self._gripper_target_position = new_target
 

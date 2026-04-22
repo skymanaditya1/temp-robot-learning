@@ -211,6 +211,10 @@ class ZMQCamera(Camera):
         if frame is None:
             raise RuntimeError(f"{self} failed to decode image")
 
+        # Publisher encodes BGR JPEGs (cv2 convention); convert to RGB so this
+        # camera emits RGB like the other lerobot camera backends.
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
         return frame
 
     @check_if_not_connected

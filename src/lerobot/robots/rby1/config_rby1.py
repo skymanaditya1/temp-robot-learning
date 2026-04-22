@@ -70,9 +70,9 @@ class RBY1Config(RobotConfig):
     # before it reaches its target position.
     gripper_current_cap: float = 5.0
 
-    # Recorded gripper width (m) below this -> command fully closed (min_q).
-    # At or above -> command fully open (max_q). 0.09 is above a typical grasp
-    # endpoint (~0.066 m), so grasps register as "closing intent".
+    # DEPRECATED (kept for CLI backward-compat): gripper commanding is now
+    # continuous — the commanded width in meters is mapped directly to a raw
+    # Dynamixel encoder target, so this threshold is no longer consulted.
     gripper_close_threshold_m: float = 0.09
 
     # Per-gripper encoder-to-meters calibration. Raw Dynamixel encoder values at
