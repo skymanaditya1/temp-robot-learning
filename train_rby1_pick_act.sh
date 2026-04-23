@@ -28,6 +28,8 @@ lerobot-train \
   --policy.device=cuda \
   --policy.push_to_hub=false \
   --policy.kl_weight="${KL_WEIGHT}" \
+  --policy.chunk_size=20 \
+  --policy.n_action_steps=20 \
   --dataset.repo_id="${REPO_ID}" \
   --dataset.root="${DATASET_ROOT}" \
   --output_dir="${OUTPUT_DIR}" \
@@ -40,4 +42,4 @@ lerobot-train \
   --seed=1000 \
   --wandb.enable=true \
   --wandb.project=rby1_pick \
-  --wandb.notes="ACT, ${DATASET_NAME}, bs=8, ${STEPS} steps, kl=${KL_WEIGHT}"
+  --wandb.notes="ACT, ${DATASET_NAME}, bs=8, ${STEPS} steps, kl=${KL_WEIGHT}, chunk=20"

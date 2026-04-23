@@ -3,7 +3,7 @@
 # dataset, compare to ground-truth actions, and plot per-joint curves.
 #
 # Usage:
-#   ./overfit_inference_plot.sh <episode> <dataset_folder_name> <checkpoint_dir>
+#   ./overfit_inference_plot.sh <episode> <dataset_folder_name> <checkpoint_dir> <checkpoint_number>
 #
 # Args:
 #   episode               Episode index in the dataset (e.g. 0, 25).
@@ -11,35 +11,35 @@
 #                         (e.g. rby1_pick_v2_20260419_180507_rgb)
 #   checkpoint_dir        Training run directory (the one containing checkpoints/)
 #                         e.g. /data/objsearch/rby1_policy_learning/outputs/train/rby1_pick_v2_act
+#   checkpoint_number     Checkpoint step under checkpoints/ (e.g. 150000, or "last").
 #
 # Env-var overrides (defaults shown):
-#   CKPT_NUM=last       Checkpoint step under checkpoints/ (e.g. 150000)
-#   DEVICE=cpu          Torch device (policy_new is CPU-only)
-#   CONDA_ENV=policy_new
+#   DEVICE=cuda         Torch device (policy_inference has CUDA; use DEVICE=cpu otherwise)
+#   CONDA_ENV=policy_inference
 #   DATASETS_ROOT=/data/objsearch/rby1_policy_learning/datasets/local
 #   OUT=<auto>          Auto-derived unique filename under temp_images/ if unset
 #
 # Examples:
 #   ./overfit_inference_plot.sh 0 rby1_pick_v2_20260419_180507_rgb \
-#       /data/objsearch/rby1_policy_learning/outputs/train/rby1_pick_v2_act
+#       /data/objsearch/rby1_policy_learning/outputs/train/rby1_pick_v2_act last
 #
-#   CKPT_NUM=150000 ./overfit_inference_plot.sh 25 rby1_pick_v2_20260419_180507_rgb \
-#       /data/objsearch/rby1_policy_learning/outputs/train/act_rby1_pick_v2_te0.01
+#   ./overfit_inference_plot.sh 25 rby1_pick_v2_20260419_180507_rgb \
+#       /data/objsearch/rby1_policy_learning/outputs/train/act_rby1_pick_v2_te0.01 150000
 
 set -e
 
-if [ "$#" -ne 3 ]; then
-    echo "Usage: $0 <episode> <dataset_folder_name> <checkpoint_dir>"
+if [ "$#" -ne 4 ]; then
+    echo "Usage: $0 <episode> <dataset_folder_name> <checkpoint_dir> <checkpoint_number>"
     exit 1
 fi
 
 EPISODE="$1"
 DATASET_NAME="$2"
 CKPT_DIR="$3"
+CKPT_NUM="$4"
 
-CKPT_NUM="${CKPT_NUM:-last}"
-DEVICE="${DEVICE:-cpu}"
-CONDA_ENV="${CONDA_ENV:-policy_new}"
+DEVICE="${DEVICE:-cuda}"
+CONDA_ENV="${CONDA_ENV:-policy_inference}"
 DATASETS_ROOT="${DATASETS_ROOT:-/data/objsearch/rby1_policy_learning/datasets/local}"
 
 DATASET_ROOT="${DATASETS_ROOT}/${DATASET_NAME}"

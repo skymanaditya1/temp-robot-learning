@@ -12,3 +12,10 @@ tests/datasets/
 wandb/
 *.log
 temp_images/
+rollouts/
+*.bak
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
