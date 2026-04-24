@@ -114,12 +114,56 @@ def state_publisher_loop(robot: RBY1, pub_socket: zmq.Socket, rate_hz: float) ->
             next_tick = time.perf_counter()
 
 
-def action_consumer_loop(robot: RBY1, pull_socket: zmq.Socket) -> None:
-    """Receive action messages and dispatch them to the robot."""
+def _snapshot_right_side(robot: RBY1, timeout_s: float = 2.0) -> dict:
+    """Capture the current right-arm joint positions + right-gripper meters.
+
+    These values are merged into every incoming action message so the right
+    side of the robot is actively held at the pose it was in at proxy
+    startup, while the workstation only commands left-arm + left-gripper.
+    """
+    # Wait until the SDK state callback has populated _latest_state
+    t0 = time.perf_counter()
+    while robot._latest_state is None:
+        if time.perf_counter() - t0 > timeout_s:
+            raise TimeoutError(
+                f"Robot state did not arrive within {timeout_s:.1f}s — cannot snapshot right side"
+            )
+        time.sleep(0.02)
+
+    with robot._state_lock:
+        state = list(robot._latest_state)
+
+    # RBY1 state vector: indices 8..14 are right-arm joints 0..6
+    right_arm = {
+        f"right_arm_{i}.pos": float(state[8 + i])
+        for i in range(7)
+    }
+
+    # Right gripper: read DXL encoder, convert to meters
+    robot._read_gripper_positions()
+    raw_enc = float(robot._gripper_positions[0])  # DXL id 0 = right gripper
+    right_gripper_m = float(robot._encoder_to_meters(raw_enc, 0))
+
+    return {"arm": right_arm, "gripper": right_gripper_m}
+
+
+def action_consumer_loop(robot: RBY1, pull_socket: zmq.Socket,
+                         frozen_right: dict | None = None) -> None:
+    """Receive action messages and dispatch them to the robot.
+
+    If `frozen_right` is provided, every incoming action is augmented (via
+    setdefault, so the workstation can still override) with right-arm joint
+    targets and a right-gripper meters target so the right side is held.
+    """
     valid_keys = set(robot._joints_dict.keys()) | set(robot._gripper_keys.keys())
     logger.info(
         f"action consumer: accepting joint/gripper targets (keys: {sorted(valid_keys)[:4]}...)"
     )
+    if frozen_right is not None:
+        logger.info(
+            f"action consumer: will hold right side at "
+            f"arm={list(frozen_right['arm'].values())} gripper={frozen_right['gripper']:.4f}m"
+        )
     tick = 0
     while not shutdown.is_set():
         try:
@@ -145,6 +189,15 @@ def action_consumer_loop(robot: RBY1, pull_socket: zmq.Socket) -> None:
         for k, v in msg.get("grippers", {}).items():
             if k in valid_keys:
                 action[k] = float(v)
+
+        # Hold the right side at its frozen pose unless the workstation
+        # explicitly commanded those dims (16-D policies still work).
+        if frozen_right is not None:
+            for k, v in frozen_right["arm"].items():
+                if k in valid_keys:
+                    action.setdefault(k, v)
+            if "right_gripper.pos" in valid_keys:
+                action.setdefault("right_gripper.pos", frozen_right["gripper"])
 
         if not action:
             logger.warning("action consumer: empty action; dropping")
@@ -192,6 +245,14 @@ def main():
     robot = RBY1(config)
     logger.info("connecting to hardware (this includes gripper homing ~5–10 s)...")
     robot.connect()
+
+    logger.info("snapshotting right-arm + right-gripper rest pose...")
+    frozen_right = _snapshot_right_side(robot, timeout_s=2.0)
+    logger.info(
+        f"right arm frozen @ {[round(v, 3) for v in frozen_right['arm'].values()]} rad, "
+        f"right gripper frozen @ {frozen_right['gripper']:.4f} m"
+    )
+
     logger.info("robot ready; opening ZMQ sockets")
 
     ctx = zmq.Context.instance()
@@ -218,7 +279,7 @@ def main():
     state_thread.start()
 
     try:
-        action_consumer_loop(robot, pull)
+        action_consumer_loop(robot, pull, frozen_right=frozen_right)
     finally:
         logger.info("shutting down: draining + disconnecting...")
         shutdown.set()
