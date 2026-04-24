@@ -92,10 +92,19 @@ def parse_camera_spec(spec: str) -> CameraSpec:
     return CameraSpec(name=parts[0], cam_type=cam_type, serial=int(parts[2]), port=int(parts[3]))
 
 
+# Publishes one ZMQ message per second regardless of the camera's internal
+# grab rate. 1 Hz is downstream pipeline's sampling rate; the ZED's own fps
+# only controls grab/depth cadence inside the SDK.
+PUBLISH_HZ = 1.0
+
+# ZED SDK rejects fps=1 at HD1080 (supported: 15/30/60). 15 is the lowest
+# accepted value, which keeps grab latency low without burning extra GPU.
+CAMERA_FPS = 15
+
+
 def run_camera_publisher(
     camera_spec: CameraSpec,
     resolution: str,
-    fps: int,
     jpeg_quality: int,
     depth_mode: str,
 ):
@@ -121,7 +130,7 @@ def run_camera_publisher(
     zed = sl.Camera()
     init_params = sl.InitParameters()
     init_params.camera_resolution = res_map.get(resolution, sl.RESOLUTION.HD1080)
-    init_params.camera_fps = fps
+    init_params.camera_fps = CAMERA_FPS
     init_params.depth_mode = depth_map.get(depth_mode, sl.DEPTH_MODE.NEURAL)
     init_params.coordinate_units = sl.UNIT.MILLIMETER
     init_params.depth_minimum_distance = 300.0  # mm
@@ -139,8 +148,8 @@ def run_camera_publisher(
     actual_res = cam_info.camera_configuration.resolution
     logger.info(
         f"[{camera_spec.name}] Opened {cam_info.camera_model} "
-        f"(S/N {cam_info.serial_number}, {actual_res.width}x{actual_res.height} @ {fps}fps, "
-        f"depth={depth_mode})"
+        f"(S/N {cam_info.serial_number}, {actual_res.width}x{actual_res.height}, "
+        f"camera_fps={CAMERA_FPS}, publish_hz={PUBLISH_HZ}, depth={depth_mode})"
     )
 
     # Intrinsics at native resolution — published unchanged every frame.
@@ -184,6 +193,9 @@ def run_camera_publisher(
     png_params = [cv2.IMWRITE_PNG_COMPRESSION, 1]
     frame_count = 0
     last_log_time = time.time()
+
+    publish_period = 1.0 / PUBLISH_HZ
+    next_deadline = time.time() + publish_period
 
     try:
         while not shutdown_event.is_set():
@@ -243,6 +255,14 @@ def run_camera_publisher(
                 frame_count = 0
                 last_log_time = now
 
+            sleep_for = next_deadline - time.time()
+            if sleep_for > 0:
+                if shutdown_event.wait(timeout=sleep_for):
+                    break
+                next_deadline += publish_period
+            else:
+                next_deadline = time.time() + publish_period
+
     except Exception:
         logger.exception(f"[{camera_spec.name}] Error in publisher loop")
     finally:
@@ -274,12 +294,6 @@ def main():
         help="Camera resolution (default: hd1080).",
     )
     parser.add_argument(
-        "--fps",
-        type=int,
-        default=30,
-        help="Camera FPS (default: 30).",
-    )
-    parser.add_argument(
         "--jpeg-quality",
         type=int,
         default=90,
@@ -309,7 +323,7 @@ def main():
     for spec in camera_specs:
         t = Thread(
             target=run_camera_publisher,
-            args=(spec, args.resolution, args.fps, args.jpeg_quality, args.depth_mode),
+            args=(spec, args.resolution, args.jpeg_quality, args.depth_mode),
             daemon=True,
             name=f"zed_pub_{spec.name}",
         )
