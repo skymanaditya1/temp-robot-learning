@@ -93,6 +93,7 @@ exec conda run -n "${CONDA_ENV}" --no-capture-output lerobot-record \
     --robot.state_port="${STATE_PORT}" \
     --robot.action_port="${ACTION_PORT}" \
     --robot.with_torso=false --robot.with_head=false \
+    --robot.with_right_arm=false --robot.with_right_gripper=false \
     --robot.cameras="$CAMS" \
     --policy.path="${POLICY_PATH}" --policy.device=cuda \
     --dataset.repo_id="${DATASET_REPO_ID}" \

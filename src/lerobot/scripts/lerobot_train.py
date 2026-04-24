@@ -187,6 +187,29 @@ def _compute_action_component_ranges(
     return ranges
 
 
+def _compute_action_dim_ranges(
+    action_names: list[str] | None,
+) -> dict[str, tuple[int, int]] | None:
+    """Map each individual action dim to a single-element (i, i+1) slice.
+
+    Used alongside `_compute_action_component_ranges` so per-dim L1 losses
+    are logged next to per-group L1 losses. Keys are prefixed with ``dim_``
+    and sanitized (dots -> underscores, trailing ``.pos`` removed) so they
+    don't collide with group keys and are safe for loggers that dislike
+    dots in scalar names.
+
+        action_names=['left_arm_0.pos', ..., 'left_gripper.pos']  ->
+          {'dim_left_arm_0': (0, 1), ..., 'dim_left_gripper': (7, 8)}
+    """
+    if not action_names:
+        return None
+    ranges: dict[str, tuple[int, int]] = {}
+    for i, name in enumerate(action_names):
+        sanitized = name.removesuffix(".pos").replace(".", "_")
+        ranges[f"dim_{sanitized}"] = (i, i + 1)
+    return ranges
+
+
 def _split_episodes_for_val(
     episode_ids: list[int], val_ratio: float, seed: int
 ) -> tuple[list[int], list[int]]:
@@ -351,10 +374,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         rename_map=cfg.rename_map,
     )
 
-    # Per-component action L1 logging: derive contiguous dim groups from dataset meta.
+    # Per-component + per-dim action L1 logging: derive contiguous dim groups
+    # AND single-element per-dim ranges from dataset meta; merge both into
+    # `action_component_ranges` so the existing loop in ACTPolicy.forward picks
+    # them both up transparently.
     if hasattr(policy.config, "action_component_ranges"):
         action_names = dataset.meta.features.get("action", {}).get("names")
-        policy.config.action_component_ranges = _compute_action_component_ranges(action_names)
+        merged_ranges: dict[str, tuple[int, int]] = {}
+        merged_ranges.update(_compute_action_component_ranges(action_names) or {})
+        merged_ranges.update(_compute_action_dim_ranges(action_names) or {})
+        policy.config.action_component_ranges = merged_ranges or None
         if is_main_process and policy.config.action_component_ranges:
             logging.info(f"Action component ranges: {policy.config.action_component_ranges}")
 

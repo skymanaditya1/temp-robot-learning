@@ -154,10 +154,12 @@ class ACTPolicy(PreTrainedPolicy):
                 comp_sum = l1_per_elem[..., start:end].sum()
                 comp_denom = denom_base * (end - start)
                 loss_dict[f"l1_loss_{name}"] = (comp_sum / comp_denom).item()
-        if self.config.use_vae:
-            # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
-            # each dimension independently, we sum over the latent dimension to get the total
-            # KL-divergence per batch element, then take the mean over the batch.
+        if self.config.use_vae and mu_hat is not None and log_sigma_x2_hat is not None:
+            # Training path: CVAE posterior was computed (self.training was True inside
+            # the model's forward). Calculate Dₖₗ(latent_pdf || standard_normal).
+            # Note: After computing the KL-divergence for each dimension independently, we
+            # sum over the latent dimension to get the total KL-divergence per batch
+            # element, then take the mean over the batch.
             # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
             mean_kld = (
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
@@ -165,6 +167,8 @@ class ACTPolicy(PreTrainedPolicy):
             loss_dict["kld_loss"] = mean_kld.item()
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
+            # Validation / inference path: the VAE encoder was skipped (z = 0 prior mode),
+            # so there is no posterior to compute KL against. Report L1 reconstruction only.
             loss = l1_loss
 
         return loss, loss_dict
