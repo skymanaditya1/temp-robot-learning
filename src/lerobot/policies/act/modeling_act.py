@@ -142,11 +142,18 @@ class ACTPolicy(PreTrainedPolicy):
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
+        valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
+        l1_per_elem = F.l1_loss(batch[ACTION], actions_hat, reduction="none") * valid_mask
+        l1_loss = l1_per_elem.mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
+        if self.config.action_component_ranges:
+            # valid_mask is (B, chunk, 1); broadcasts across the action-dim slice.
+            denom_base = valid_mask.sum().clamp(min=1)
+            for name, (start, end) in self.config.action_component_ranges.items():
+                comp_sum = l1_per_elem[..., start:end].sum()
+                comp_denom = denom_base * (end - start)
+                loss_dict[f"l1_loss_{name}"] = (comp_sum / comp_denom).item()
         if self.config.use_vae:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total

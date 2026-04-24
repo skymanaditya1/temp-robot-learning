@@ -19,7 +19,10 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
+import random
+import re
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -155,6 +158,101 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def _component_name_from_dim(dim_name: str) -> str:
+    """Group an action dim name into a component label.
+
+    'right_arm_3.pos' -> 'right_arm', 'right_gripper.pos' -> 'right_gripper',
+    'base.vx' -> 'base', 'torso_0.pos' -> 'torso'.
+    """
+    base = dim_name.split(".")[0]
+    return re.sub(r"_\d+$", "", base)
+
+
+def _compute_action_component_ranges(
+    action_names: list[str] | None,
+) -> dict[str, tuple[int, int]] | None:
+    """Map contiguous spans of same-component dims to (start, end) slices."""
+    if not action_names:
+        return None
+    ranges: dict[str, tuple[int, int]] = {}
+    current = _component_name_from_dim(action_names[0])
+    start = 0
+    for i, name in enumerate(action_names[1:], start=1):
+        comp = _component_name_from_dim(name)
+        if comp != current:
+            ranges[current] = (start, i)
+            current = comp
+            start = i
+    ranges[current] = (start, len(action_names))
+    return ranges
+
+
+def _split_episodes_for_val(
+    episode_ids: list[int], val_ratio: float, seed: int
+) -> tuple[list[int], list[int]]:
+    rng = random.Random(seed)
+    shuffled = list(episode_ids)
+    rng.shuffle(shuffled)
+    n_val = max(1, round(len(shuffled) * val_ratio))
+    n_val = min(n_val, len(shuffled) - 1)  # keep at least one train episode
+    val = sorted(shuffled[:n_val])
+    train = sorted(shuffled[n_val:])
+    return train, val
+
+
+@torch.no_grad()
+def validate_policy(
+    policy: PreTrainedPolicy,
+    val_dataloader,
+    preprocessor,
+    accelerator: "Accelerator",
+) -> dict[str, float]:
+    """Run one pass over the validation set and return sample-weighted averages.
+
+    Aggregates `loss` and every scalar entry in the policy's `loss_dict` output.
+    """
+    policy.eval()
+    device = accelerator.device
+    sum_loss = torch.tensor(0.0, device=device)
+    sum_weight = torch.tensor(0.0, device=device)
+    sum_metrics: dict[str, torch.Tensor] = {}
+
+    for batch in val_dataloader:
+        batch = preprocessor(batch)
+        bsz = 0
+        for v in batch.values() if isinstance(batch, dict) else ():
+            if isinstance(v, torch.Tensor) and v.ndim > 0:
+                bsz = int(v.shape[0])
+                break
+        if bsz == 0:
+            continue
+        with accelerator.autocast():
+            loss, loss_dict = policy.forward(batch)
+        w = torch.tensor(float(bsz), device=device)
+        sum_loss += loss.detach().to(dtype=torch.float32) * w
+        sum_weight += w
+        for k, v in loss_dict.items():
+            if isinstance(v, (int, float)):
+                scalar = torch.tensor(float(v), device=device)
+            elif isinstance(v, torch.Tensor) and v.numel() == 1:
+                scalar = v.detach().to(device=device, dtype=torch.float32)
+            else:
+                continue
+            if k not in sum_metrics:
+                sum_metrics[k] = torch.tensor(0.0, device=device)
+            sum_metrics[k] += scalar * w
+
+    total_loss = accelerator.reduce(sum_loss, reduction="sum")
+    total_weight = accelerator.reduce(sum_weight, reduction="sum")
+    if total_weight.item() == 0:
+        return {}
+    out = {"loss": (total_loss / total_weight).item()}
+    for k in sorted(sum_metrics.keys()):
+        total_m = accelerator.reduce(sum_metrics[k], reduction="sum")
+        out[k] = (total_m / total_weight).item()
+    return out
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     """
@@ -252,6 +350,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+
+    # Per-component action L1 logging: derive contiguous dim groups from dataset meta.
+    if hasattr(policy.config, "action_component_ranges"):
+        action_names = dataset.meta.features.get("action", {}).get("names")
+        policy.config.action_component_ranges = _compute_action_component_ranges(action_names)
+        if is_main_process and policy.config.action_component_ranges:
+            logging.info(f"Action component ranges: {policy.config.action_component_ranges}")
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
@@ -364,14 +469,48 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    # Train/val split by episode. Disabled when val_split_ratio <= 0.
+    use_validation = cfg.val_split_ratio > 0.0 and cfg.val_freq > 0
+    val_episodes: list[int] | None = None
+    train_episodes: list[int] | None = None
+    if use_validation:
+        val_seed = cfg.val_seed if cfg.val_seed is not None else cfg.seed
+        if val_seed is None:
+            val_seed = 42
+        all_eps = (
+            list(dataset.episodes)
+            if dataset.episodes is not None
+            else list(range(dataset.num_episodes))
+        )
+        train_episodes, val_episodes = _split_episodes_for_val(all_eps, cfg.val_split_ratio, val_seed)
+        if is_main_process:
+            logging.info(
+                f"Train/val split: {len(train_episodes)} train / {len(val_episodes)} val episodes "
+                f"(seed={val_seed})"
+            )
+            split_path = cfg.output_dir / "val_split.json"
+            split_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(split_path, "w") as f:
+                json.dump(
+                    {
+                        "val_seed": val_seed,
+                        "val_split_ratio": cfg.val_split_ratio,
+                        "train_episodes": train_episodes,
+                        "val_episodes": val_episodes,
+                    },
+                    f,
+                    indent=2,
+                )
+
+    drop_n_last = getattr(cfg.policy, "drop_n_last_frames", 0)
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    if hasattr(cfg.policy, "drop_n_last_frames") or use_validation:
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
+            episode_indices_to_use=train_episodes if use_validation else dataset.episodes,
+            drop_n_last_frames=drop_n_last,
             shuffle=True,
         )
     else:
@@ -389,11 +528,35 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    val_dataloader = None
+    if use_validation:
+        val_sampler = EpisodeAwareSampler(
+            dataset.meta.episodes["dataset_from_index"],
+            dataset.meta.episodes["dataset_to_index"],
+            episode_indices_to_use=val_episodes,
+            drop_n_last_frames=drop_n_last,
+            shuffle=False,
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            sampler=val_sampler,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    if val_dataloader is not None:
+        policy, optimizer, dataloader, lr_scheduler, val_dataloader = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler, val_dataloader
+        )
+    else:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler
+        )
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -456,6 +619,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = use_validation and step % cfg.val_freq == 0
 
         if is_log_step:
             logging.info(train_tracker)
@@ -475,6 +639,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        if is_val_step:
+            if is_main_process:
+                logging.info(f"Running validation at step {step}")
+            val_metrics = validate_policy(policy, val_dataloader, preprocessor, accelerator)
+            if is_main_process and val_metrics:
+                val_str = " | ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items())
+                logging.info(f"val @ step {step}: {val_str}")
+                if wandb_logger:
+                    wandb_logger.log_dict(val_metrics, step, mode="eval")
+            policy.train()
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:

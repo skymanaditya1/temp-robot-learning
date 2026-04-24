@@ -63,6 +63,12 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Fraction of episodes held out for validation (0 disables).
+    val_split_ratio: float = 0.0
+    # Run validation every N training steps (0 disables).
+    val_freq: int = 0
+    # Seed for the train/val episode split; falls back to `seed` if None.
+    val_seed: int | None = None
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None

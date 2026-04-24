@@ -38,6 +38,8 @@ lerobot-train \
   --steps="${STEPS}" \
   --save_freq="${SAVE_FREQ}" \
   --log_freq=200 \
+  --val_split_ratio=0.1 \
+  --val_freq=2000 \
   --num_workers=4 \
   --seed=1000 \
   --wandb.enable=true \
