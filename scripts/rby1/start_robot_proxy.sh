@@ -38,6 +38,11 @@ if [ "${WITH_HEAD:-false}" = "true" ]; then
     EXTRA_ARGS+=(--with-head)
 fi
 
+# Mirror all output to a logfile too — `conda run --no-capture-output` plus a
+# pipeline can buffer Python's stderr in some environments, so a persistent
+# tail-able log is the cheapest way to keep visibility.
+LOG_FILE="${LOG_FILE:-/tmp/robot_proxy.log}"
+
 echo "Starting RBY1 robot proxy:"
 echo "  conda env         : ${CONDA_ENV}"
 echo "  robot address     : ${ROBOT_ADDRESS}"
@@ -45,13 +50,16 @@ echo "  state PUB port    : ${STATE_PORT}  (pubs at ${STATE_RATE_HZ} Hz)"
 echo "  action PULL port  : ${ACTION_PORT}"
 echo "  gripper current   : ${GRIPPER_CURRENT_CAP} A"
 echo "  with_torso/head   : ${WITH_TORSO:-false} / ${WITH_HEAD:-false}"
+echo "  log file          : ${LOG_FILE}"
 echo ""
 
-exec conda run -n "${CONDA_ENV}" --no-capture-output python \
+# `python -u` and PYTHONUNBUFFERED=1 force unbuffered stdout/stderr so logs
+# stream live to both the terminal and the logfile.
+PYTHONUNBUFFERED=1 conda run -n "${CONDA_ENV}" --no-capture-output python -u \
     /data/objsearch/rby1_policy_learning/scripts/rby1/robot_proxy.py \
     --robot-address "${ROBOT_ADDRESS}" \
     --state-port "${STATE_PORT}" \
     --action-port "${ACTION_PORT}" \
     --state-rate-hz "${STATE_RATE_HZ}" \
     --gripper-current-cap "${GRIPPER_CURRENT_CAP}" \
-    "${EXTRA_ARGS[@]}"
+    "${EXTRA_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"

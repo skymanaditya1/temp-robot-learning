@@ -63,6 +63,16 @@ class RBY1Config(RobotConfig):
     # Dynamixel grippers via a background thread so recorded gripper values are
     # replayed on the real hardware. Automatically skipped in master-arm mode.
     enable_gripper_commanding: bool = True
+    # If True, lerobot will NOT touch the gripper bus state (no torque toggle,
+    # no operating-mode change, no homing, no tool-flange power-cycle, no
+    # parking). The writer thread still runs so the trajectory's gripper
+    # actions reach the Dynamixels — but it uses the (right|left)_gripper_enc_*
+    # config values directly as the homed min/max for the width->encoder
+    # translation. Use this when an external process (e.g. RainbowGripperController
+    # on the UPC) has already homed the bus and is temporarily releasing it for
+    # this lerobot session. Multi-turn frame must be preserved across the handoff
+    # — i.e. nothing should power-cycle the tool flange in between.
+    skip_gripper_homing: bool = False
     # Gripper flow (matches arms_teleop.py): homing in CurrentControlMode first,
     # then operate in CurrentBasedPositionControlMode with a fixed current cap and
     # position commands bounded to the per-session homed [min_q, max_q] range.

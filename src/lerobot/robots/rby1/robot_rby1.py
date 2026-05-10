@@ -112,6 +112,8 @@ class RBY1(Robot):
         self._gripper_target_lock = Lock()
         self._gripper_writer_running = False
         self._gripper_writer_thread: Thread | None = None
+        self._orig_gripper_modes = None  # snapshotted at connect for disconnect restore
+        self._orig_gripper_torque = None
 
         # Cameras
         self.cameras = make_cameras_from_configs(config.cameras)
@@ -229,8 +231,47 @@ class RBY1(Robot):
                 logger.warning(f"Failed to open gripper bus: {e}. Gripper readings will be zero.")
                 self._gripper_bus = None
 
-        # Gripper write setup (only when SDK commanding + gripper commanding enabled).
+        # === skip_gripper_homing branch ===
+        # When an external owner of /dev/rby1_gripper (e.g. the
+        # RainbowGripperController on the UPC) has already homed the bus and
+        # released it for this lerobot session, do NOT re-touch the bus state.
+        # Use config calibration as preset homed_min/max so the writer's
+        # width->encoder translation matches the external owner's frame.
         if (
+            self.config.skip_gripper_homing
+            and not self.config.use_external_commands
+            and self.config.enable_gripper_commanding
+            and self._gripper_bus is not None
+        ):
+            try:
+                logger.info("[skip_gripper_homing] using config calibration as preset homed range; bus state untouched")
+                self._gripper_homed_min = [
+                    float(self.config.right_gripper_enc_closed),
+                    float(self.config.left_gripper_enc_closed),
+                ]
+                self._gripper_homed_max = [
+                    float(self.config.right_gripper_enc_open),
+                    float(self.config.left_gripper_enc_open),
+                ]
+                self._gripper_write_enabled = True
+                self._gripper_writer_running = True
+                self._gripper_writer_thread = Thread(
+                    target=self._gripper_writer_loop, daemon=True
+                )
+                self._gripper_writer_thread.start()
+                logger.info(
+                    f"[skip_gripper_homing] writer started. Preset ranges: "
+                    f"right=[{self._gripper_homed_min[0]:.2f}, {self._gripper_homed_max[0]:.2f}], "
+                    f"left=[{self._gripper_homed_min[1]:.2f}, {self._gripper_homed_max[1]:.2f}]"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[skip_gripper_homing] failed to start writer: {e}. Grippers will be read-only."
+                )
+                self._gripper_write_enabled = False
+
+        # Gripper write setup (only when SDK commanding + gripper commanding enabled).
+        elif (
             not self.config.use_external_commands
             and self.config.enable_gripper_commanding
             and self._gripper_bus is not None
@@ -240,6 +281,28 @@ class RBY1(Robot):
                 for arm in ("right", "left"):
                     self._robot.set_tool_flange_output_voltage(arm, 12)
                 self._gripper_bus.set_torque_constant([1, 1])
+
+                # Snapshot the pre-lerobot bus state (operating_mode + torque_enable
+                # for each gripper Dynamixel) so disconnect() can put the bus back
+                # in the exact state the rby1 firmware's gripper service expects.
+                # use_cache=False forces a fresh bus read; cached values can be
+                # stale if other processes touched the bus.
+                self._orig_gripper_modes = None
+                self._orig_gripper_torque = None
+                # Snapshot piecewise so a single API mismatch doesn't lose both reads.
+                # Note: read_operating_mode takes (ids, use_cache); read_torque_enable
+                # takes only (ids). Different signatures in this rby1_sdk binding.
+                try:
+                    self._orig_gripper_modes = self._gripper_bus.group_fast_sync_read_operating_mode([0, 1], False)
+                    logger.info(f"[connect-snap] pre-lerobot operating_mode={self._orig_gripper_modes}")
+                except Exception as e:
+                    logger.warning(f"[connect-snap] read operating_mode failed: {e}")
+                try:
+                    self._orig_gripper_torque = self._gripper_bus.group_fast_sync_read_torque_enable([0, 1])
+                    logger.info(f"[connect-snap] pre-lerobot torque_enable={self._orig_gripper_torque}")
+                except Exception as e:
+                    logger.warning(f"[connect-snap] read torque_enable failed: {e}")
+
                 # Torque must be disabled before operating-mode change.
                 self._gripper_bus.group_sync_write_torque_enable([(0, 0), (1, 0)])
                 self._gripper_bus.group_sync_write_operating_mode(
@@ -334,16 +397,31 @@ class RBY1(Robot):
             return self.config.left_gripper_enc_open, self.config.left_gripper_enc_closed
         raise ValueError(f"unknown gripper dxl_id: {dxl_id}")
 
+    def _gripper_endpoints(self, dxl_id: int) -> tuple[float, float]:
+        """Return (enc_open, enc_closed) for this session.
+
+        Prefer the homed limits captured during connect() — they faithfully
+        track multi-turn encoder drift across power cycles. Fall back to the
+        static config constants only if homing has not run yet (e.g. before
+        connect() returns).
+        """
+        if self._gripper_write_enabled:
+            return (
+                float(self._gripper_homed_max[dxl_id]),  # open
+                float(self._gripper_homed_min[dxl_id]),  # closed
+            )
+        return self._gripper_calibration(dxl_id)
+
     def _encoder_to_meters(self, raw_enc: float, dxl_id: int) -> float:
         """Convert raw Dynamixel encoder value to gripper width in meters (0.0–0.1m)."""
-        enc_open, enc_closed = self._gripper_calibration(dxl_id)
+        enc_open, enc_closed = self._gripper_endpoints(dxl_id)
         width_m = 0.1 * (raw_enc - enc_closed) / (enc_open - enc_closed)
         return float(np.clip(width_m, 0.0, 0.1))
 
     def _meters_to_encoder(self, width_m: float, dxl_id: int) -> float:
         """Inverse of _encoder_to_meters. Clamps input to the 0.0-0.1m range first."""
         width_m = float(np.clip(width_m, 0.0, 0.1))
-        enc_open, enc_closed = self._gripper_calibration(dxl_id)
+        enc_open, enc_closed = self._gripper_endpoints(dxl_id)
         return enc_closed + (width_m / 0.1) * (enc_open - enc_closed)
 
     def _home_grippers(self) -> None:
@@ -359,6 +437,40 @@ class RBY1(Robot):
         stability_ticks = 20
         stability_tol = 0.02
         homing_current = 0.5
+
+        # Power-cycle the tool flange on both arms so any latched Dynamixel
+        # shutdown (overload / overheat / overcurrent from a prior failed
+        # grasp or from the SDK leaving the gripper in a position-hold state)
+        # gets cleared before the homing torque sweep. Without this, a latched
+        # motor silently rejects torque_enable=1, the homing sweep stalls
+        # instantly on that side, the encoder span is mis-calibrated, and all
+        # subsequent grasps under-clamp.
+        try:
+            for arm in ("right", "left"):
+                self._robot.set_tool_flange_output_voltage(arm, 0)
+            time.sleep(0.5)
+            for arm in ("right", "left"):
+                self._robot.set_tool_flange_output_voltage(arm, 12)
+            time.sleep(0.5)
+            # Re-enable torque after the power cycle (voltage drop disabled it).
+            self._gripper_bus.group_sync_write_torque_enable([(0, 1), (1, 1)])
+        except Exception as e:
+            logger.warning(f"Tool-flange power-cycle pre-homing failed: {e}")
+
+        # Pre-homing motor diagnostics: read the present operating mode + any
+        # exposed motor state per gripper. If a motor is in a non-CurrentControl
+        # mode after we just set it, that's a strong signal that a latched
+        # error is rejecting the mode change.
+        try:
+            modes = self._gripper_bus.group_fast_sync_read_operating_mode([0, 1], False)
+            logger.info(f"[homing-diag] pre-homing operating modes: {modes}")
+        except Exception as e:
+            logger.warning(f"[homing-diag] read operating mode failed: {e}")
+        try:
+            states = self._gripper_bus.get_motor_states([0, 1])
+            logger.info(f"[homing-diag] pre-homing motor states: {states}")
+        except Exception as e:
+            logger.warning(f"[homing-diag] get_motor_states failed: {e}")
 
         logger.info("Homing grippers (~5-10 s)...")
         q = np.array([0.0, 0.0])
@@ -420,28 +532,46 @@ class RBY1(Robot):
         self._gripper_homed_max = [float(max_q[0]), float(max_q[1])]
 
     def _gripper_writer_loop(self) -> None:
-        """Background thread: at 20 Hz, write the latest gripper target positions."""
+        """Background thread: at 20 Hz, write targets AND read encoders.
+
+        This is the *only* owner of the Dynamixel bus once running. Other
+        threads (state publisher, snapshot helper, etc.) must read from
+        ``self._gripper_positions`` instead of touching the bus directly —
+        rby1_sdk's DynamixelBus is not thread-safe and concurrent C-level
+        access has triggered ``free(): invalid pointer`` aborts.
+        """
         period = 0.05  # 20 Hz
         tick = 0
+        last_read_err: str | None = None
         while self._gripper_writer_running:
             try:
                 with self._gripper_target_lock:
                     targets = list(self._gripper_target_position)
                 if self._gripper_bus is not None:
+                    # Write positions
                     self._gripper_bus.group_sync_write_send_position(
                         [(dev_id, q) for dev_id, q in enumerate(targets)]
                     )
-                # Periodic visibility: what are we commanding vs. actual position.
-                if tick % 40 == 0:
+                    # Read encoders every tick → refresh the cache other
+                    # threads consume. Failure here is non-fatal but we
+                    # surface a sample so the cause is visible if persistent.
                     try:
                         rv = self._gripper_bus.group_fast_sync_read_encoder([0, 1])
-                        enc = {int(d): float(e) for d, e in (rv or [])}
-                        logger.info(
-                            f"gripper writer tick {tick}: target={targets} "
-                            f"enc_right={enc.get(0, 'n/a')} enc_left={enc.get(1, 'n/a')}"
-                        )
-                    except Exception:
-                        pass
+                        if rv:
+                            for dev_id, enc in rv:
+                                self._gripper_positions[int(dev_id)] = float(enc)
+                        last_read_err = None
+                    except Exception as e:  # noqa: BLE001
+                        last_read_err = f"{type(e).__name__}: {e}"
+                # Periodic visibility: what we're commanding vs. cached actual.
+                if tick % 40 == 0:
+                    er = self._gripper_positions[0]
+                    el = self._gripper_positions[1]
+                    logger.info(
+                        f"gripper writer tick {tick}: target={targets} "
+                        f"enc_right={er:.3f} enc_left={el:.3f}"
+                        + (f" [last_read_err: {last_read_err}]" if last_read_err else "")
+                    )
                 tick += 1
             except Exception as e:
                 logger.warning(f"gripper writer tick error: {e}")
@@ -633,8 +763,8 @@ class RBY1(Robot):
                 if new_target != self._gripper_target_position:
                     logger.info(
                         f"gripper target: {self._gripper_target_position} -> {new_target} "
-                        f"(right={gripper_goals.get('right_gripper.pos', '-'):.4f}m, "
-                        f"left={gripper_goals.get('left_gripper.pos', '-'):.4f}m)"
+                        f"(right={(lambda v: f'{v:.4f}' if isinstance(v, (int, float)) else str(v))(gripper_goals.get('right_gripper.pos', '-'))}m, "
+                        f"left={(lambda v: f'{v:.4f}' if isinstance(v, (int, float)) else str(v))(gripper_goals.get('left_gripper.pos', '-'))}m)"
                     )
                 self._gripper_target_position = new_target
 
@@ -656,11 +786,44 @@ class RBY1(Robot):
             if self._gripper_writer_thread is not None:
                 self._gripper_writer_thread.join(timeout=1.0)
                 self._gripper_writer_thread = None
-        if self._gripper_write_enabled and self._gripper_bus is not None:
+        if self._gripper_write_enabled and self._gripper_bus is not None and self.config.skip_gripper_homing:
+            # skip_gripper_homing path: we never modified bus state on connect,
+            # so there is nothing to restore. Don't toggle torque/mode either —
+            # leave the bus exactly as the external owner (RainbowGripperController)
+            # had it. The port will be closed below.
+            logger.info("[disconnect] skip_gripper_homing=True; leaving bus state untouched for external owner")
+            self._gripper_write_enabled = False
+        elif self._gripper_write_enabled and self._gripper_bus is not None:
+            # Restore the bus to the EXACT pre-lerobot state we snapshotted in
+            # connect(). Guessing the right operating mode (e.g. CurrentControlMode)
+            # didn't work — the rby1 firmware's gripper service can be in any of
+            # several modes at boot, and we don't want to second-guess it. The
+            # snapshot tells us the truth. We also drop the disconnect-time tool-
+            # flange power-cycle: that left the Dynamixel in its hardware-default
+            # state (PositionControlMode, torque off) which the firmware doesn't
+            # auto-reconfigure, leaving the right gripper unresponsive.
             try:
+                # IMPORTANT: do NOT zero goal_current here. The pre-lerobot mode
+                # is CurrentBasedPositionControlMode (mode 5), where goal_current
+                # is the *current cap*, not a torque command. Zeroing it leaves
+                # the motor electrically alive but with a 0 A budget → no motion
+                # possible from any subsequent SDK command. The writer thread
+                # already left goal_current = current_cap (5 A), which is the
+                # correct cap for normal operation; let it stand.
+                # 1) Torque must be off before any operating-mode change.
                 self._gripper_bus.group_sync_write_torque_enable([(0, 0), (1, 0)])
-            except Exception:
-                pass
+                # 2) Restore operating mode (if we successfully snapshotted it).
+                if self._orig_gripper_modes is not None:
+                    self._gripper_bus.group_sync_write_operating_mode(self._orig_gripper_modes)
+                    logger.info(f"[disconnect] restored operating_mode={self._orig_gripper_modes}")
+                else:
+                    logger.warning("[disconnect] no snapshotted operating_mode — leaving bus as-is")
+                # 3) Restore torque_enable (if we successfully snapshotted it).
+                if self._orig_gripper_torque is not None:
+                    self._gripper_bus.group_sync_write_torque_enable(self._orig_gripper_torque)
+                    logger.info(f"[disconnect] restored torque_enable={self._orig_gripper_torque}")
+            except Exception as e:
+                logger.warning(f"Failed to restore pre-lerobot gripper bus state: {e}")
             self._gripper_write_enabled = False
 
         # Close command stream (SDK commanding mode only)

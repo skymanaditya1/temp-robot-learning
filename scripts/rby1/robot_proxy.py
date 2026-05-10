@@ -46,7 +46,11 @@ import zmq
 from lerobot.robots.rby1.config_rby1 import RBY1Config
 from lerobot.robots.rby1.robot_rby1 import RBY1
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True,  # lerobot imports install a StreamHandler @ WARNING; force re-applies our config
+)
 logger = logging.getLogger("robot_proxy")
 
 shutdown = Event()
@@ -77,7 +81,12 @@ def state_publisher_loop(robot: RBY1, pub_socket: zmq.Socket, rate_hz: float) ->
             # Pull current state (no cameras — proxy is configured with cameras={})
             with robot._state_lock:
                 state = robot._latest_state
-            robot._read_gripper_positions()
+            # NOTE: do NOT call robot._read_gripper_positions() here.
+            # The gripper writer thread owns the DXL bus and refreshes
+            # robot._gripper_positions[] every tick (20 Hz). Reading from
+            # this thread too would cause concurrent C-FFI access into
+            # rby1_sdk.DynamixelBus, which has aborted the process with
+            # `free(): invalid pointer`.
 
             joints_out = {}
             if state is not None:
@@ -139,8 +148,11 @@ def _snapshot_right_side(robot: RBY1, timeout_s: float = 2.0) -> dict:
         for i in range(7)
     }
 
-    # Right gripper: read DXL encoder, convert to meters
-    robot._read_gripper_positions()
+    # Right gripper: read from the cache the writer thread maintains.
+    # Do NOT call robot._read_gripper_positions() here — the writer thread
+    # already owns the DXL bus by this point (connect() started it). The
+    # cache was seeded during connect()'s "Parking grippers OPEN" step, so
+    # reading it now gives a fresh value with zero bus contention.
     raw_enc = float(robot._gripper_positions[0])  # DXL id 0 = right gripper
     right_gripper_m = float(robot._encoder_to_meters(raw_enc, 0))
 
@@ -148,12 +160,17 @@ def _snapshot_right_side(robot: RBY1, timeout_s: float = 2.0) -> dict:
 
 
 def action_consumer_loop(robot: RBY1, pull_socket: zmq.Socket,
-                         frozen_right: dict | None = None) -> None:
+                         frozen_right: dict | None = None,
+                         log_path: str | None = None) -> None:
     """Receive action messages and dispatch them to the robot.
 
     If `frozen_right` is provided, every incoming action is augmented (via
     setdefault, so the workstation can still override) with right-arm joint
     targets and a right-gripper meters target so the right side is held.
+
+    If `log_path` is provided, every received-and-merged action is appended
+    as a JSON line to that file (one tick per line):
+        {"ts": <recv_time>, "joints": {...}, "grippers": {...}}
     """
     valid_keys = set(robot._joints_dict.keys()) | set(robot._gripper_keys.keys())
     logger.info(
@@ -164,6 +181,12 @@ def action_consumer_loop(robot: RBY1, pull_socket: zmq.Socket,
             f"action consumer: will hold right side at "
             f"arm={list(frozen_right['arm'].values())} gripper={frozen_right['gripper']:.4f}m"
         )
+
+    log_file = None
+    if log_path is not None:
+        log_file = open(log_path, "a", buffering=1)  # line-buffered
+        logger.info(f"action consumer: logging received actions to {log_path}")
+
     tick = 0
     while not shutdown.is_set():
         try:
@@ -183,12 +206,16 @@ def action_consumer_loop(robot: RBY1, pull_socket: zmq.Socket,
 
         # Merge joints + grippers into the flat dict RBY1.send_action expects
         action: dict[str, float] = {}
+        joints_log: dict[str, float] = {}
+        grippers_log: dict[str, float] = {}
         for k, v in msg.get("joints", {}).items():
             if k in valid_keys:
                 action[k] = float(v)
+                joints_log[k] = float(v)
         for k, v in msg.get("grippers", {}).items():
             if k in valid_keys:
                 action[k] = float(v)
+                grippers_log[k] = float(v)
 
         # Hold the right side at its frozen pose unless the workstation
         # explicitly commanded those dims (16-D policies still work).
@@ -202,6 +229,13 @@ def action_consumer_loop(robot: RBY1, pull_socket: zmq.Socket,
         if not action:
             logger.warning("action consumer: empty action; dropping")
             continue
+
+        if log_file is not None:
+            log_file.write(json.dumps({
+                "ts": time.time(),
+                "joints": joints_log,
+                "grippers": grippers_log,
+            }) + "\n")
 
         try:
             robot.send_action(action)
@@ -221,6 +255,9 @@ def main():
     parser.add_argument("--with-torso", action="store_true", default=False)
     parser.add_argument("--with-head", action="store_true", default=False)
     parser.add_argument("--gripper-current-cap", type=float, default=5.0)
+    parser.add_argument("--log-actions", default=None,
+                        help="If set, append every received action to this path "
+                             "as JSON-lines: {ts, joints, grippers}")
     args = parser.parse_args()
 
     _install_signal_handlers()
@@ -279,7 +316,8 @@ def main():
     state_thread.start()
 
     try:
-        action_consumer_loop(robot, pull, frozen_right=frozen_right)
+        action_consumer_loop(robot, pull, frozen_right=frozen_right,
+                             log_path=args.log_actions)
     finally:
         logger.info("shutting down: draining + disconnecting...")
         shutdown.set()
