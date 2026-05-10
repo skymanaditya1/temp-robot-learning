@@ -33,14 +33,14 @@ RESIZE_H=${4:-480}
 
 CAMERAS=(
     "head_cam:stereo:32938613:5555:hd720"
-    "right_wrist_cam:mono:314996496:5556"
-    "left_wrist_cam:mono:311689153:5557"
+    "right_wrist_cam:mono:306470987:5556"
+    "left_wrist_cam:mono:301119863:5557"
 )
 
 echo "Starting ZED publisher @ ${RESOLUTION}, ${FPS} fps"
 echo "  head_cam        (stereo, S/N 32938613)   -> tcp://*:5555"
-echo "  right_wrist_cam (mono,   S/N 314996496) -> tcp://*:5556"
-echo "  left_wrist_cam  (mono,   S/N 311689153) -> tcp://*:5557"
+echo "  right_wrist_cam (mono,   S/N 306470987) -> tcp://*:5556"
+echo "  left_wrist_cam  (mono,   S/N 301119863) -> tcp://*:5557"
 echo ""
 
 RESIZE_ARGS=()
