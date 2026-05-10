@@ -98,6 +98,7 @@ def run(args):
             with_head=False,
             use_external_commands=False,
             gripper_current_cap=args.gripper_current_a,
+            command_duration=args.command_duration,
         )
         robot = make_robot_from_config(robot_cfg)
         robot_action_processor = make_default_robot_action_processor()
@@ -167,6 +168,12 @@ def main():
     p.add_argument("--robot-address", default="192.168.30.1:50051")
     p.add_argument("--gripper-current-a", type=float, default=5.0,
                    help="Gripper current cap (A). Only used with --replay-on-robot.")
+    p.add_argument("--command-duration", type=float, default=0.2,
+                   help=("set_minimum_time(τ) for each JointPositionCommand. "
+                         "Should be roughly 2× the playback tick interval "
+                         "(=2×1/fps) so successive 100ms-spaced waypoints blend "
+                         "instead of decelerating to zero at every sample. "
+                         "Default 0.2s for 10 fps datasets."))
     run(p.parse_args())
 
 
