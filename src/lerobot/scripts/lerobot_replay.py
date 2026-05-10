@@ -113,6 +113,11 @@ def replay(cfg: ReplayConfig):
 
     try:
         log_say("Replaying episode", cfg.play_sounds, blocking=True)
+        # Smoothly move to the dataset's first action over 5 s before starting
+        # normal-rate playback. Temporarily bump command_duration on the robot
+        # config, then restore it.
+        FIRST_ACTION_DURATION = 5.0
+        original_command_duration = getattr(robot.config, 'command_duration', 0.1)
         for idx in range(dataset.num_frames):
             start_episode_t = time.perf_counter()
 
@@ -124,6 +129,13 @@ def replay(cfg: ReplayConfig):
             robot_obs = robot.get_observation()
 
             processed_action = robot_action_processor((action, robot_obs))
+
+            if idx == 0:
+                robot.config.command_duration = FIRST_ACTION_DURATION
+                _ = robot.send_action(processed_action)
+                robot.config.command_duration = original_command_duration
+                precise_sleep(FIRST_ACTION_DURATION)
+                continue
 
             _ = robot.send_action(processed_action)
 
