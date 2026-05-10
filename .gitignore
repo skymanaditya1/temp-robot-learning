@@ -19,3 +19,4 @@ rollouts/
 *.swp
 *~
 .DS_Store
+session_encoder_values/
